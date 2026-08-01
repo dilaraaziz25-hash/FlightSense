@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+events_cache.json
+.env
+.venv/
+venv/
+
+*.zip
+Screen Recording*.zip
+data/*.json
