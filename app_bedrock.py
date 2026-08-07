@@ -197,8 +197,6 @@ with col_btn1:
 # ── Load data ─────────────────────────────────────────────────────────────────
 
 flights, passengers, logs = load_data()
-if flights:
-    st.session_state.data_loaded = True
 
 DISRUPTED_STATUSES = ['cancelled', 'delayed', 'diverted', 'incident']
 
@@ -247,7 +245,16 @@ with tab1:
 
             if status in DISRUPTED_STATUSES:
                 status_color = '#FF4444'
-                note = '<span style="color:#888888;font-size:12px;">✓ CS processed</span>' if proc else '<span style="color:#FF4444;font-size:12px;">⚠ needs CS</span>'
+                confidence = flight.get('confidence', '')
+                if confidence == 'high':
+                    conf_badge = ' <span style="color:#00CC66;font-size:11px;">✅ 2-source</span>'
+                elif confidence == 'conflict':
+                    conf_badge = ' <span style="color:#FF8800;font-size:11px;">⚡ conflict</span>'
+                elif confidence == 'unconfirmed':
+                    conf_badge = ' <span style="color:#888888;font-size:11px;">⚠ 1-source</span>'
+                else:
+                    conf_badge = ''
+                note = f'<span style="color:#888888;font-size:12px;">✓ CS processed</span>{conf_badge}' if proc else f'<span style="color:#FF4444;font-size:12px;">⚠ needs CS</span>{conf_badge}'
             elif status == 'departed':
                 status_color = '#888888'
                 note = '<span style="color:#888888;font-size:12px;">🛫 departed</span>'
