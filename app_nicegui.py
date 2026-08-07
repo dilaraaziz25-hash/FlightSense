@@ -137,7 +137,7 @@ def audio_b64(audio_bytes):
 
 # ── Emma (Bedrock) ────────────────────────────────────────────────────────────
 
-CS_SYSTEM = """You are Emma, a customer service agent at Turkish Airlines handling flight disruptions.
+CS_SYSTEM_TEMPLATE = """You are Emma, a customer service agent at {airline} handling a flight disruption.
 Tone: professional, warm, efficient — the way an experienced airline agent speaks, not a script.
 Use the passenger's first name naturally, not in every line. Use city names, not airport codes.
 No markdown formatting. Keep responses concise and focused.
@@ -145,11 +145,12 @@ Do not invent flight times or numbers not already provided.
 Never claim to be human or an AI. If asked, say warmly: "I'm Emma, and I'm here to help you."
 Never offer to transfer — you handle everything yourself."""
 
-def emma_call(prompt, history):
+def emma_call(prompt, history, airline="the airline"):
+    system_prompt = CS_SYSTEM_TEMPLATE.format(airline=airline)
     msgs = history + [{"role": "user", "content": [{"text": prompt}]}]
     r = bedrock.converse(
         modelId=MODEL_ID,
-        system=[{"text": CS_SYSTEM}],
+        system=[{"text": system_prompt}],
         messages=msgs,
         inferenceConfig={"maxTokens": 300},
     )
@@ -221,41 +222,119 @@ def main_page():
 
     flights_exist = os.path.exists("data/flights.json") and os.path.getsize("data/flights.json") > 10
 
-    with ui.row().classes("q-pa-md items-center gap-4"):
+    with ui.column().classes("q-pa-md w-full").style("gap:8px;"):
 
-        async def on_run():
-            script  = "pnr_generator_demo_bedrock.py" if not os.path.exists("data/flights.json") else "fetch_live_status.py"
-            label_s = "Fetching flights and generating PNRs..." if script == "pnr_generator_demo_bedrock.py" else "Refreshing flight statuses..."
-            run_btn.disable()
-            run_btn.set_text("⏳ Working...")
-            status_label.set_text(label_s)
-            await asyncio.to_thread(
-                subprocess.run,
-                [sys.executable, script],
-                capture_output=True, text=True,
-                cwd=os.path.dirname(os.path.abspath(__file__))
-            )
-            if not os.path.exists("data/disruption_log.json"):
+        with ui.row().classes("items-center gap-4"):
+
+            async def on_run():
+                is_first = not os.path.exists("data/flights.json")
+                script   = "pnr_generator_demo_bedrock.py" if is_first else "fetch_live_status.py"
+                run_btn.disable()
+                run_btn.set_text("⏳ Working...")
+
+                # ── Live step-by-step status ──────────────────────────────
+                status_label.set_text("Fetching AviationStack...")
+                aviationstack_badge.set_text("AviationStack ...")
+                aviationstack_badge.style("color:#FFD700; font-family:monospace; font-size:13px; background:#1a1a0a; border:1px solid #FFD700; padding:3px 10px; border-radius:12px;")
+                opensky_badge.set_text("AeroDataBox ...")
+                opensky_badge.style("color:#FFD700; font-family:monospace; font-size:13px; background:#1a1a0a; border:1px solid #FFD700; padding:3px 10px; border-radius:12px;")
+                opensky_tb_badge.set_text("OpenSky (conflict tiebreaker)")
+                opensky_tb_badge.style(BADGE_DIM)
+
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, script],
+                    capture_output=True, text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+
+                # Ping AeroDataBox to confirm the second source is reachable
+                def check_aerodatabox():
+                    try:
+                        import requests as _req
+                        adb_key = os.getenv("AERODATABOX_KEY", "")
+                        if not adb_key:
+                            return False
+                        # Use a lightweight airport lookup to confirm the key works
+                        r = _req.get(
+                            "https://prod.api.market/api/v1/aedbx/aerodatabox/airports/iata/LHR",
+                            headers={"x-api-market-key": adb_key},
+                            timeout=8
+                        )
+                        return r.status_code == 200
+                    except Exception:
+                        return False
+
+                adb_ok = await asyncio.to_thread(check_aerodatabox)
+
+                # Always reset the disruption log on a new fetch — old processed entries
+                # are stale once fresh flight data comes in
                 with open("data/disruption_log.json", "w") as f:
                     json.dump([], f)
-            state["data_loaded"] = True
-            state["cs_phase"]    = "idle"
-            state["cs_messages"] = []
-            state["cs_passenger"] = None
-            run_btn.enable()
-            run_btn.set_text("🔄 REFRESH DATA" if os.path.exists("data/flights.json") else "▶ RUN AGENT")
-            status_label.set_text("✅ Data loaded")
-            refresh_all()
 
-        btn_text = "🔄 REFRESH DATA" if flights_exist else "▶ RUN AGENT"
-        run_btn = ui.button(btn_text, on_click=on_run).style(
-            "background:#1a1a2e; color:#FFD700; border:1px solid #FFD700; font-family:monospace;"
-        )
-        status_label = ui.label("Awaiting agent start..." if not flights_exist else "Data available — click REFRESH to update").style(
-            "color:#888; font-family:monospace; font-size:0.85rem;"
-        )
-        if flights_exist:
-            state["data_loaded"] = True
+                state["data_loaded"] = True
+                state["cs_phase"]    = "idle"
+                state["cs_messages"] = []
+                state["cs_passenger"] = None
+                run_btn.enable()
+                run_btn.set_text("🔄 REFRESH DATA" if os.path.exists("data/flights.json") else "▶ RUN AGENT")
+
+                # ── Update badges permanently ─────────────────────────────
+                # Check if any conflicts exist (OpenSky was called as tiebreaker)
+                try:
+                    _flights = json.load(open("data/flights.json"))
+                    _has_conflict = any(f.get("confidence") in ("conflict", "conflict_operating", "confirmed") for f in _flights)
+                    _opensky_used = any("OpenSky" in f.get("sources", []) for f in _flights)
+                except Exception:
+                    _has_conflict = False
+                    _opensky_used = False
+
+                n_sources = "3" if _opensky_used else ("2" if adb_ok else "1")
+                status_label.set_text(f"✅ Data loaded — {n_sources} source{'s' if int(n_sources) > 1 else ''} active")
+                aviationstack_badge.set_text("AviationStack ✓")
+                aviationstack_badge.style(BADGE_GREEN)
+                if adb_ok:
+                    opensky_badge.set_text("AeroDataBox ✓")
+                    opensky_badge.style(BADGE_GREEN)
+                else:
+                    opensky_badge.set_text("AeroDataBox — unavailable")
+                    opensky_badge.style(BADGE_ORANGE)
+                if _opensky_used:
+                    opensky_tb_badge.set_text("OpenSky ✓ (tiebreaker)")
+                    opensky_tb_badge.style(BADGE_GREEN)
+                elif _has_conflict:
+                    opensky_tb_badge.set_text("OpenSky — unavailable (conflict unresolved)")
+                    opensky_tb_badge.style(BADGE_ORANGE)
+                else:
+                    opensky_tb_badge.set_text("OpenSky (conflict tiebreaker)")
+                    opensky_tb_badge.style(BADGE_DIM)
+
+                refresh_all()
+
+            btn_text = "🔄 REFRESH DATA" if flights_exist else "▶ RUN AGENT"
+            run_btn = ui.button(btn_text, on_click=on_run).style(
+                "background:#1a1a2e; color:#FFD700; border:1px solid #FFD700; font-family:monospace;"
+            )
+            status_label = ui.label("Awaiting agent start..." if not flights_exist else "Data available — click REFRESH to update").style(
+                "color:#888; font-family:monospace; font-size:0.85rem;"
+            )
+            if flights_exist:
+                state["data_loaded"] = True
+
+        # ── Persistent source badges (shown after first run) ──────────────
+        BADGE_GREEN  = "color:#00CC66; font-family:monospace; font-size:13px; background:#0a1a0a; border:1px solid #00CC66; padding:3px 10px; border-radius:12px;"
+        BADGE_ORANGE = "color:#FF8800; font-family:monospace; font-size:13px; background:#1a1000; border:1px solid #FF8800; padding:3px 10px; border-radius:12px;"
+        BADGE_DIM    = "color:#555; font-family:monospace; font-size:13px; background:#111; border:1px solid #333; padding:3px 10px; border-radius:12px;"
+
+        with ui.row().classes("items-center gap-3").style("margin-top:2px;"):
+            av_text  = "AviationStack ✓" if flights_exist else "AviationStack"
+            adb_text = "AeroDataBox ✓"   if flights_exist else "AeroDataBox"
+            os_text  = "OpenSky (conflict tiebreaker)"
+            av_style  = BADGE_GREEN if flights_exist else BADGE_DIM
+            adb_style = BADGE_GREEN if flights_exist else BADGE_DIM
+            aviationstack_badge = ui.label(av_text).style(av_style)
+            opensky_badge       = ui.label(adb_text).style(adb_style)
+            opensky_tb_badge    = ui.label(os_text).style(BADGE_DIM)
 
     ui.separator().style("border-color:#333;")
 
@@ -306,12 +385,18 @@ def main_page():
             disrupted_n  = sum(1 for f in flights if f["status"] in DISRUPTED)
             processed_n  = sum(1 for f in flights if f.get("processed"))
             scheduled_n  = sum(1 for f in flights if f["status"] == "scheduled")
+            conflict_n   = sum(1 for f in flights if f.get("confidence") == "conflict")
 
             with ui.row().classes("gap-8 q-mb-md"):
-                for label, val in [("Total Flights", len(flights)), ("Scheduled", scheduled_n),
-                                    ("Disrupted", disrupted_n), ("CS Processed", processed_n)]:
+                for label, val, color in [
+                    ("Total Flights", len(flights),  "#FFD700"),
+                    ("Scheduled",     scheduled_n,   "#4488FF"),
+                    ("Disrupted",     disrupted_n,   "#FF4444"),
+                    ("Conflict",      conflict_n,    "#FF8800"),
+                    ("CS Processed",  processed_n,   "#00CC66"),
+                ]:
                     with ui.card().style("background:#1a1a2e; min-width:120px;"):
-                        ui.label(str(val)).style("color:#FFD700; font-size:1.8rem; font-family:monospace; font-weight:bold;")
+                        ui.label(str(val)).style(f"color:{color}; font-size:1.8rem; font-family:monospace; font-weight:bold;")
                         ui.label(label).style("color:#888; font-size:0.75rem; font-family:monospace;")
 
             # Header row
@@ -325,19 +410,22 @@ def main_page():
                 proc   = fl.get("processed", False)
                 conf   = fl.get("confidence", "")
 
-                status_color = "#FF4444" if status in DISRUPTED else "#888888" if status == "departed" else "#00CC66"
+                status_color = "#FF4444" if status in DISRUPTED else "#888888" if status == "departed" else "#4488FF" if status == "active" else "#00CC66"
 
+                effective_conf = conf if conf else "unconfirmed"
                 if status in DISRUPTED:
                     if proc:
                         note_html = '<span style="color:#888;font-size:14px;">✓ CS processed</span>'
                     else:
                         note_html = '<span style="color:#FF4444;font-size:14px;">⚠ needs CS</span>'
-                    # Default to unconfirmed if no confidence field (e.g. manually edited)
-                    effective_conf = conf if conf else "unconfirmed"
                     if effective_conf == "high":
                         note_html += ' <span class="badge-high">✅ 2-source</span>'
+                    elif effective_conf == "confirmed":
+                        note_html += ' <span class="badge-high">✅ 3-source</span>'
                     elif effective_conf == "conflict":
                         note_html += ' <span class="badge-conf">⚡ conflict</span>'
+                    elif effective_conf == "conflict_operating":
+                        note_html += ' <span class="badge-conf">✈️ likely operating</span>'
                     elif effective_conf == "unconfirmed":
                         note_html += ' <span class="badge-single">⚠ 1-source</span>'
                 elif status == "departed":
@@ -347,14 +435,45 @@ def main_page():
 
                 sched = fl.get("scheduled", "")
                 sched = sched[11:16] if len(sched) >= 16 else sched
+                is_conflict = status in DISRUPTED and effective_conf in ("conflict", "conflict_operating", "confirmed")
 
-                with ui.row().classes("w-full flight-row items-center").style("flex-wrap:nowrap; gap:0;"):
-                    ui.label(fl["flight_iata"]).style("color:#fff;font-family:monospace;font-size:16px;width:10%;flex-shrink:0;")
-                    ui.label(fl["airline"]).style("color:#ccc;font-family:monospace;font-size:15px;width:20%;flex-shrink:0;")
-                    ui.label(get_city(fl["destination"])).style("color:#fff;font-family:monospace;font-size:16px;width:18%;flex-shrink:0;")
-                    ui.label(sched).style("color:#ccc;font-family:monospace;font-size:16px;width:10%;flex-shrink:0;")
-                    ui.label(status.upper()).style(f"color:{status_color};font-family:monospace;font-size:16px;width:12%;flex-shrink:0;")
-                    ui.html(note_html).style("width:30%;flex-shrink:0;font-size:15px;")
+                # Build conflict detail block and embed toggle link into note_html
+                detail_html = ""
+                if is_conflict:
+                    av_says = status.upper()
+                    if effective_conf == "conflict_operating":
+                        header_color = "#FF8800"
+                        header_text  = "⚡ Conflict — OpenSky confirms flight is OPERATING"
+                        opensky_line = f'&nbsp;&nbsp;OpenSky &nbsp;&nbsp;&nbsp;&nbsp;→ <span style="color:#00CC66;">AIRBORNE ✈️ — cancellation likely incorrect</span><br>'
+                        footer       = "Passenger contact BLOCKED. Verify with airline directly."
+                    elif effective_conf == "confirmed":
+                        header_color = "#FFD700"
+                        header_text  = "✅ Conflict resolved — OpenSky supports cancellation"
+                        opensky_line = f'&nbsp;&nbsp;OpenSky &nbsp;&nbsp;&nbsp;&nbsp;→ <span style="color:#888;">NOT DETECTED 🚫 — transponder silent</span><br>'
+                        footer       = "Cancellation confirmed by 3 sources. Safe to contact passengers."
+                    else:
+                        header_color = "#FF8800"
+                        header_text  = "⚡ Data conflict — OpenSky tiebreaker unavailable"
+                        opensky_line = f'&nbsp;&nbsp;OpenSky &nbsp;&nbsp;&nbsp;&nbsp;→ <span style="color:#555;">unavailable</span><br>'
+                        footer       = "Passenger contact on hold. Refresh to retry OpenSky check."
+
+                    # Show conflict details inline — always visible, no toggle needed
+                    note_html += (
+                        f' <span style="font-family:monospace;font-size:11px;color:#888;">'
+                        f'AV:<span style="color:#FF4444;">{av_says}</span> '
+                        f'ADB:<span style="color:#00CC66;">EXPECTED</span> '
+                        f'{opensky_line.replace("<br>","").strip()}'
+                        f'</span>'
+                    )
+
+                with ui.column().classes("w-full").style("gap:0;"):
+                    with ui.row().classes("w-full flight-row items-center").style("flex-wrap:nowrap; gap:0;"):
+                        ui.label(fl["flight_iata"]).style("color:#fff;font-family:monospace;font-size:16px;width:10%;flex-shrink:0;")
+                        ui.label(fl["airline"]).style("color:#ccc;font-family:monospace;font-size:15px;width:20%;flex-shrink:0;")
+                        ui.label(get_city(fl["destination"])).style("color:#fff;font-family:monospace;font-size:16px;width:18%;flex-shrink:0;")
+                        ui.label(sched).style("color:#ccc;font-family:monospace;font-size:16px;width:10%;flex-shrink:0;")
+                        ui.label(status.upper()).style(f"color:{status_color};font-family:monospace;font-size:16px;width:12%;flex-shrink:0;")
+                        ui.html(note_html).style("width:30%;flex-shrink:0;font-size:15px;")
 
     def render_tab2():
         t2_container.clear()
@@ -412,6 +531,9 @@ def main_page():
             other      = sum(v for k, v in counts.items()
                              if k not in {"scheduled","cancelled","delayed","departed","diverted"})
 
+            # Conflict = disrupted flights where sources disagree (any conflict variant)
+            conflicts  = sum(1 for fl in flights if fl.get("confidence") in ("conflict", "conflict_operating"))
+
             # ── Count departures by hour ──────────────────────────────────────
             hour_counts = [0] * 24
             for fl in flights:
@@ -423,31 +545,31 @@ def main_page():
                 except Exception:
                     pass
 
-            # ── Fare at risk (affected passengers) ───────────────────────────
+            # ── Affected passengers ───────────────────────────────────────────
             pnr_data = load_passengers()  # dict: {pnr: passenger_record}
             flight_map = {f["flight_iata"]: f for f in flights}
-            fare_pending   = 0.0
-            fare_recovered = 0.0
+            pax_pending   = 0
+            pax_resolved  = 0
             for pnr, p in pnr_data.items():
                 fi = flight_map.get(p.get("flight_iata", ""))
                 if fi and fi["status"] in DISRUPTED:
-                    fare = float(p.get("fare_amount", 0))
                     if fi.get("processed"):
-                        fare_recovered += fare
+                        pax_resolved += 1
                     else:
-                        fare_pending += fare
+                        pax_pending += 1
 
             # ── Row 1: two charts side by side ───────────────────────────────
             with ui.row().classes("w-full gap-4"):
 
                 # Donut — status breakdown
                 donut_data = []
-                if scheduled:  donut_data.append({"value": scheduled, "name": "Scheduled",  "itemStyle": {"color": "#4488FF"}})
-                if cancelled:  donut_data.append({"value": cancelled, "name": "Cancelled",  "itemStyle": {"color": "#FF4444"}})
-                if delayed:    donut_data.append({"value": delayed,   "name": "Delayed",    "itemStyle": {"color": "#FF8800"}})
-                if departed:   donut_data.append({"value": departed,  "name": "Departed",   "itemStyle": {"color": "#888888"}})
-                if diverted:   donut_data.append({"value": diverted,  "name": "Diverted",   "itemStyle": {"color": "#CC44FF"}})
-                if other:      donut_data.append({"value": other,     "name": "Other",      "itemStyle": {"color": "#44CCAA"}})
+                if scheduled:  donut_data.append({"value": scheduled,  "name": "Scheduled",  "itemStyle": {"color": "#4488FF"}})
+                if cancelled:  donut_data.append({"value": cancelled,  "name": "Cancelled",  "itemStyle": {"color": "#FF4444"}})
+                if delayed:    donut_data.append({"value": delayed,    "name": "Delayed",    "itemStyle": {"color": "#FF8800"}})
+                if departed:   donut_data.append({"value": departed,   "name": "Departed",   "itemStyle": {"color": "#888888"}})
+                if diverted:   donut_data.append({"value": diverted,   "name": "Diverted",   "itemStyle": {"color": "#CC44FF"}})
+                if conflicts:  donut_data.append({"value": conflicts,  "name": "Conflict",   "itemStyle": {"color": "#FF8800"}})
+                if other:      donut_data.append({"value": other,      "name": "Other",      "itemStyle": {"color": "#44CCAA"}})
 
                 with ui.card().style("background:#1a1a2e; flex:1; min-width:300px;"):
                     ui.label("Flight Status Breakdown").style(
@@ -502,19 +624,20 @@ def main_page():
                         }]
                     }).style("height:280px;")
 
-            # ── Row 2: fare at risk ───────────────────────────────────────────
+            # ── Row 2: affected passengers ────────────────────────────────────
             ui.separator().style("border-color:#333; margin:16px 0 12px;")
-            ui.label("Passenger Fare at Risk").style(
+            ui.label("Affected Passengers").style(
                 "color:#FFD700; font-family:monospace; font-size:16px; font-weight:bold; margin-bottom:8px;"
             )
             with ui.card().style("background:#1a1a2e; width:100%;"):
                 ui.echart({
                     "backgroundColor": "transparent",
                     "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-                    "grid": {"left": "4%", "right": "4%", "bottom": "5%", "top": "5%", "containLabel": True},
+                    "grid": {"left": "4%", "right": "8%", "bottom": "5%", "top": "5%", "containLabel": True},
                     "xAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#888", "fontFamily": "monospace", "formatter": "${value}"},
+                        "minInterval": 1,
+                        "axisLabel": {"color": "#888", "fontFamily": "monospace"},
                         "splitLine": {"lineStyle": {"color": "#222"}}
                     },
                     "yAxis": {
@@ -525,12 +648,12 @@ def main_page():
                     "series": [{
                         "type": "bar",
                         "data": [
-                            {"value": round(fare_pending, 2),   "itemStyle": {"color": "#FF4444"}},
-                            {"value": round(fare_recovered, 2), "itemStyle": {"color": "#00CC66"}}
+                            {"value": pax_pending,  "itemStyle": {"color": "#FF4444"}},
+                            {"value": pax_resolved, "itemStyle": {"color": "#00CC66"}}
                         ],
                         "label": {
                             "show": True, "position": "right",
-                            "formatter": "${c}",
+                            "formatter": "{c} pax",
                             "color": "#FFD700", "fontFamily": "monospace", "fontSize": 13
                         },
                         "barMaxWidth": 50
@@ -585,7 +708,7 @@ def main_page():
                         "pnr":        pnr,
                         "name":       p["passenger_name"],
                         "flight":     p["flight_iata"],
-                        "origin":     fi.get("origin", "IST"),
+                        "origin":     fi.get("origin", "LHR"),
                         "destination": get_city(p["destination"]),
                         "dest_iata":  p["destination"],
                         "status":     fi["status"],
@@ -611,6 +734,20 @@ def main_page():
                 async def start_call():
                     idx = names.index(sel.value)
                     p   = candidates[idx]
+
+                    # Block CS if flight is in conflict — sources disagree, do not contact
+                    flights    = load_flights()
+                    flight_map = {f["flight_iata"]: f for f in flights}
+                    fl         = flight_map.get(p["flight"], {})
+                    confidence = fl.get("confidence", "")
+                    if confidence in ("conflict", "conflict_operating"):
+                        reason = "sources disagree (AviationStack vs AeroDataBox)" if confidence == "conflict" else "OpenSky confirms flight is AIRBORNE"
+                        ui.notify(
+                            f"⚡ BLOCKED — {p['flight']} is in conflict: {reason}. Do not contact passengers until resolved.",
+                            type="negative", timeout=6000
+                        )
+                        return
+
                     state["cs_passenger"] = p
                     state["cs_messages"]  = []
                     state["cs_choice"]    = ""
@@ -621,7 +758,7 @@ def main_page():
                               f"Greet them warmly by first name. Inform them of the disruption with genuine empathy. "
                               f"Ask if it is a good time to talk. Under 80 words.")
 
-                    text = await asyncio.to_thread(emma_call, prompt, [])
+                    text = await asyncio.to_thread(emma_call, prompt, [], p['airline'])
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                     try:
                         audio = await asyncio.to_thread(synth, text)
@@ -691,26 +828,37 @@ def main_page():
                                 reply = reply_input.value.strip()
                                 if not reply:
                                     return
-                                reply_input.set_value("")
+                                # Keep text visible while Emma is thinking — clear only once reply arrives
                                 state["cs_messages"].append({"role": "user", "content": [{"text": reply}]})
                                 await process_reply(reply)
+                                try:
+                                    reply_input.set_value("")
+                                except Exception:
+                                    pass  # element may have been removed if tab re-rendered
 
                             async def use_mic():
-                                transcript = await ui.run_javascript("""
-                                    return new Promise((resolve) => {
-                                        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-                                        if (!SR) { resolve(''); return; }
-                                        const r = new SR();
-                                        r.lang = 'en-US';
-                                        r.continuous = false;
-                                        r.interimResults = false;
-                                        r.onresult = (e) => resolve(e.results[0][0].transcript);
-                                        r.onerror  = () => resolve('');
-                                        r.start();
-                                    });
-                                """, timeout=15.0)
+                                try:
+                                    transcript = await ui.run_javascript("""
+                                        return new Promise((resolve) => {
+                                            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+                                            if (!SR) { resolve(''); return; }
+                                            const r = new SR();
+                                            r.lang = 'en-US';
+                                            r.continuous = false;
+                                            r.interimResults = false;
+                                            r.onresult = (e) => resolve(e.results[0][0].transcript);
+                                            r.onerror  = () => resolve('');
+                                            r.onend    = () => resolve('');
+                                            r.start();
+                                        });
+                                    """, timeout=20.0)
+                                except TimeoutError:
+                                    transcript = ''
                                 if transcript:
-                                    reply_input.set_value(transcript)
+                                    try:
+                                        reply_input.set_value(transcript)
+                                    except Exception:
+                                        pass
 
                             ui.button("📤 Send", on_click=send_reply).style(
                                 "background:#1a1a4e; color:#FFD700; border:1px solid #FFD700; font-family:monospace;"
@@ -761,7 +909,7 @@ def main_page():
                               "2. Full refund to original payment method within 5-7 business days\n"
                               "3. Hotel accommodation tonight and rebook on tomorrow's flight, all covered\n"
                               "Ask which option they prefer. Under 100 words.")
-                    text  = await asyncio.to_thread(emma_call, prompt, hist)
+                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                     try:   audio = await asyncio.to_thread(synth, text)
                     except: audio = None
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -785,7 +933,7 @@ def main_page():
                             state["cs_handoff"] = "Requires approval: " + " and ".join(reasons) + "."
                             prompt = (f"The passenger requested a refund. Requires supervisor approval ({' and '.join(reasons)}). "
                                       f"Tell {p['name'].split()[0]} warmly you are escalating — standard procedure. Under 60 words.")
-                            text  = await asyncio.to_thread(emma_call, prompt, hist)
+                            text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                             try:   audio = await asyncio.to_thread(synth, text)
                             except: audio = None
                             state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -794,7 +942,7 @@ def main_page():
                         else:
                             prompt = (f"Confirm the refund for {p['name'].split()[0]}. "
                                       "5-7 business days to original payment method. Warm and brief. Do NOT say goodbye yet. Under 60 words.")
-                            text  = await asyncio.to_thread(emma_call, prompt, hist)
+                            text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                             try:   audio = await asyncio.to_thread(synth, text)
                             except: audio = None
                             state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -804,7 +952,7 @@ def main_page():
                     elif choice == "rebook":
                         prompt = (f"Confirm rebooking to {p['destination']} for {p['name'].split()[0]}. "
                                   "Next available flight, confirmation email shortly. Do NOT say goodbye yet. Under 60 words.")
-                        text  = await asyncio.to_thread(emma_call, prompt, hist)
+                        text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                         try:   audio = await asyncio.to_thread(synth, text)
                         except: audio = None
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -814,7 +962,7 @@ def main_page():
                     elif choice == "voucher":
                         prompt = (f"Confirm hotel voucher tonight and rebooking tomorrow to {p['destination']} for {p['name'].split()[0]}. "
                                   "All costs covered by the airline. Do NOT say goodbye yet. Under 60 words.")
-                        text  = await asyncio.to_thread(emma_call, prompt, hist)
+                        text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                         try:   audio = await asyncio.to_thread(synth, text)
                         except: audio = None
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -832,7 +980,7 @@ def main_page():
                 elif phase == "turn3":
                     prompt = (f"Close the call warmly with {p['name'].split()[0]}. "
                               "Apologise once more for the inconvenience, wish them well, say a warm goodbye. Under 50 words.")
-                    text  = await asyncio.to_thread(emma_call, prompt, hist)
+                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                     try:   audio = await asyncio.to_thread(synth, text)
                     except: audio = None
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
@@ -842,6 +990,7 @@ def main_page():
                     state["cs_phase"] = "complete"
                     render_cs_conversation(text, audio)
                     refresh_tab1_tab2()
+                    render_tab4()
                     render_tab5()
 
             async def process_approved():
@@ -856,7 +1005,7 @@ def main_page():
                 else:
                     prompt = f"Hotel voucher and rebooking tomorrow to {p['destination']} for {p['name'].split()[0]} all arranged. Confirm warmly, all costs covered. Do NOT say goodbye yet. Under 60 words."
 
-                text  = await asyncio.to_thread(emma_call, prompt, hist)
+                text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
                 try:   audio = await asyncio.to_thread(synth, text)
                 except: audio = None
                 state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})

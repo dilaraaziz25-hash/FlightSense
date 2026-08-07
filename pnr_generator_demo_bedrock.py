@@ -1,9 +1,9 @@
 """
 pnr_generator_demo_bedrock.py
-Fetches live IST flights from Aviationstack (1 API call).
+Fetches live LHR flights from AviationStack (2 calls: general + cancelled feed).
+Cross-validates disruptions against AeroDataBox for 2-source confidence.
 Skips: active (in-air), landed (arrived) — not relevant for disruption POC.
 Keeps: scheduled, cancelled, diverted, incident, delayed.
-Adds processed=False field to all flights.
 Generates synthetic PNR database via AWS Bedrock.
 """
 import boto3
@@ -22,18 +22,90 @@ bedrock = boto3.client(
 
 MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 AVIATIONSTACK_KEY = os.getenv("AVIATIONSTACK_API_KEY")
+AERODATABOX_KEY   = os.getenv("AERODATABOX_KEY")
+AERODATABOX_BASE  = "https://prod.api.market/api/v1/aedbx/aerodatabox"
 
-SKIP_STATUSES = ['active', 'landed']   # not useful for disruption POC
+SKIP_STATUSES      = ['landed']   # keep active — real in-flight departures shown on board
+DISRUPTED_STATUSES = ['cancelled', 'delayed', 'diverted', 'incident']
+
+
+def confirm_with_aerodatabox(flight_iata, scheduled_date):
+    """Query AeroDataBox for a flight's current status. Returns normalised status string."""
+    if not AERODATABOX_KEY:
+        return 'unknown'
+    try:
+        url = f"{AERODATABOX_BASE}/flights/Number/{flight_iata}/{scheduled_date}"
+        resp = requests.get(url, headers={"x-api-market-key": AERODATABOX_KEY}, timeout=10)
+        if resp.status_code != 200:
+            return 'unknown'
+        data = resp.json()
+        if isinstance(data, list):
+            today_flights = [
+                f for f in data
+                if scheduled_date in (f.get('departure', {}).get('scheduledTime', {}).get('utc', ''))
+            ]
+            data = today_flights[0] if today_flights else (data[-1] if data else {})
+        raw = (data.get('status') or '').lower()
+        if 'cancel' in raw:   return 'cancelled'
+        if 'delay'  in raw:   return 'delayed'
+        if 'divert' in raw:   return 'diverted'
+        if raw in ('active', 'en-route', 'airborne', 'enroute'): return 'active'
+        if raw in ('scheduled', 'expected'):  return 'scheduled'
+        if raw == 'arrived':  return 'arrived'
+        return raw or 'unknown'
+    except Exception as e:
+        print(f"  ⚠️  AeroDataBox error for {flight_iata}: {e}")
+        return 'unknown'
+
+
+def cross_validate(flight_iata, av_status, scheduled_date):
+    """Returns (confidence, sources) tuple."""
+    if av_status not in DISRUPTED_STATUSES:
+        return 'ok', ['AviationStack']
+
+    adb_status = confirm_with_aerodatabox(flight_iata, scheduled_date)
+    print(f"  🔍 {flight_iata}: AviationStack={av_status.upper()} | AeroDataBox={adb_status.upper()}")
+
+    if adb_status in ('unknown', 'arrived'):
+        return 'unconfirmed', ['AviationStack']
+
+    if av_status in DISRUPTED_STATUSES and adb_status in DISRUPTED_STATUSES:
+        return 'high', ['AviationStack', 'AeroDataBox']
+    elif av_status in DISRUPTED_STATUSES and adb_status in ('active', 'scheduled'):
+        print(f"  ⚡ CONFLICT: {flight_iata} — AviationStack={av_status.upper()} but AeroDataBox={adb_status.upper()}")
+        return 'conflict', ['AviationStack', 'AeroDataBox']
+    return 'unconfirmed', ['AviationStack']
 
 def fetch_real_flights():
+    """
+    Two API calls:
+    1. Scheduled flights from LHR (the bulk)
+    2. Cancelled/disrupted flights from LHR (explicit filter — AviationStack
+       often omits cancellations from the general feed on free plans)
+    Results are merged and deduplicated by flight IATA.
+    """
     url = "http://api.aviationstack.com/v1/flights"
-    params = {
-        "access_key": AVIATIONSTACK_KEY,
-        "dep_iata": "IST",
-        "limit": 100
-    }
-    response = requests.get(url, params=params)
-    return response.json()
+    base_params = {"access_key": AVIATIONSTACK_KEY, "dep_iata": "LHR"}
+
+    # Call 1 — general feed (scheduled + whatever else comes back)
+    r1 = requests.get(url, params={**base_params, "limit": 80})
+    data1 = r1.json()
+
+    # Call 2 — explicitly request cancelled flights
+    r2 = requests.get(url, params={**base_params, "flight_status": "cancelled", "limit": 20})
+    data2 = r2.json()
+
+    print(f"  AviationStack general feed: {len(data1.get('data', []))} flights")
+    print(f"  AviationStack cancelled feed: {len(data2.get('data', []))} flights")
+
+    # Merge — use dict keyed on flight IATA to deduplicate
+    merged = {}
+    for flight in data1.get('data', []) + data2.get('data', []):
+        iata = flight.get('flight', {}).get('iata')
+        if iata and iata not in merged:
+            merged[iata] = flight
+
+    return {"data": list(merged.values())}
 
 def parse_flights(data):
     flights = []
@@ -85,7 +157,8 @@ def generate_pnrs_for_batch(batch, existing_pnrs):
     used_pnrs = list(existing_pnrs.keys())
 
     prompt = f"""Create a passenger PNR database for these flights.
-1 passenger per flight. Use ONLY flight codes from this list:
+1 passenger per flight. Use ONLY flight codes from this list — including cancelled ones
+(passengers booked BEFORE the cancellation, so every flight has exactly 1 passenger):
 {flight_list}
 
 For each passenger, assign a realistic cabin_class ("economy", "premium_economy", or "business")
@@ -127,13 +200,33 @@ def generate_pnr_database(flights):
 
 
 if __name__ == "__main__":
-    print("Fetching IST flights from Aviationstack...")
+    from collections import Counter
+    from datetime import datetime
+
+    print("Fetching LHR flights from Aviationstack...")
     raw_data = fetch_real_flights()
     flights = parse_flights(raw_data)
 
-    from collections import Counter
     status_counts = Counter(f['status'] for f in flights)
-    print(f"Saved {len(flights)} flights: {dict(status_counts)}")
+    print(f"Parsed {len(flights)} flights: {dict(status_counts)}")
+
+    # Cross-validate disrupted flights against AeroDataBox
+    today = datetime.now().strftime('%Y-%m-%d')
+    if AERODATABOX_KEY:
+        print(f"\n🔍 Cross-validating disruptions with AeroDataBox...")
+        for flight in flights:
+            if flight['status'] in DISRUPTED_STATUSES:
+                confidence, sources = cross_validate(flight['flight_iata'], flight['status'], today)
+                flight['confidence'] = confidence
+                flight['sources']    = sources
+            else:
+                flight['confidence'] = 'ok'
+                flight['sources']    = ['AviationStack']
+    else:
+        print("⚠️  AERODATABOX_KEY not set — skipping cross-validation")
+        for flight in flights:
+            flight['confidence'] = 'unconfirmed' if flight['status'] in DISRUPTED_STATUSES else 'ok'
+            flight['sources']    = ['AviationStack']
 
     with open('data/flights.json', 'w') as f:
         json.dump(flights, f, indent=2)

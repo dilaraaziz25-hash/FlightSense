@@ -103,7 +103,7 @@ Under 120 words. No markdown."""
 
     response = bedrock.converse(
         modelId=MODEL_ID,
-        system=[{"text": """You are Emma, a customer service agent at Turkish Airlines handling flight disruptions.
+        system=[{"text": """You are Emma, a customer service agent at London Heathrow Airport handling flight disruptions across all airlines.
 Tone: professional, warm, efficient — the way an experienced airline agent speaks, not a script.
 Use city names, not airport codes. If a passenger asks to speak with a human agent, acknowledge
 the request professionally rather than arguing or redirecting them back to yourself."""}],
@@ -170,7 +170,7 @@ def run_disruption_agent():
     print("=" * 55)
 
     # Step 1: Find unprocessed disrupted flights
-    disrupted = fetch_daily_flights("IST")
+    disrupted = fetch_daily_flights("LHR")
 
     if not disrupted:
         print("✅ No new disruptions to process.")
@@ -186,6 +186,17 @@ def run_disruption_agent():
         airline      = flight['airline']
 
         print(f"── {flight_iata} → {destination} [{status.upper()}] ({airline})")
+
+        # Skip if sources still disagree — do not contact passengers
+        confidence = flight.get('confidence', '')
+        if confidence == 'conflict':
+            print(f"   ⚡ SKIPPED — AviationStack vs AeroDataBox conflict, OpenSky unavailable")
+            print(f"      Passengers will NOT be contacted. Refresh data to retry OpenSky tiebreaker.")
+            continue
+        if confidence == 'conflict_operating':
+            print(f"   ✈️  SKIPPED — OpenSky confirms {flight_iata} is AIRBORNE. Cancellation likely incorrect.")
+            print(f"      Passengers will NOT be contacted.")
+            continue
 
         # Find affected passengers
         affected = find_affected_pnrs(flight_iata)

@@ -3,14 +3,18 @@ fetch_live_status.py
 
 Production-grade monitoring — run periodically after initial baseline fetch.
 
-Logic:
-- Fetch fresh IST snapshot from Aviationstack
-- Cross-validate disruptions against OpenSky Network (free, no key required)
-- For flights in watchlist: update status if changed
-- Add confidence field: 'high' (both sources agree) / 'unconfirmed' (single source only)
-- Remove landed/active flights from watchlist (no longer relevant)
-- Add new flights not yet in watchlist (scheduled/cancelled only)
-- Preserve processed=True flag — never reset a processed flight
+Three-source validation logic:
+  1. AviationStack  — primary flight status feed
+  2. AeroDataBox    — independent status cross-check
+  3. OpenSky        — transponder tiebreaker (only called on conflict)
+
+Confidence levels:
+  'high'        — AviationStack + AeroDataBox both confirm disruption
+  'conflict'    — sources disagree; OpenSky called as tiebreaker:
+                    airborne  → 'conflict_operating' (flight is flying, do NOT contact)
+                    silent    → 'confirmed' (transponder silent, treat as cancelled)
+  'unconfirmed' — AeroDataBox has no data; single source only
+  'ok'          — scheduled flight, no validation needed
 """
 import requests
 import json
@@ -20,72 +24,124 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY          = os.getenv("AVIATIONSTACK_API_KEY")
+API_KEY            = os.getenv("AVIATIONSTACK_API_KEY")
+AERODATABOX_KEY    = os.getenv("AERODATABOX_KEY")
 DISRUPTED_STATUSES = ['cancelled', 'delayed', 'diverted', 'incident']
-SKIP_STATUSES      = ['active', 'landed']
+SKIP_STATUSES      = ['landed']   # keep active — real in-flight departures shown on board
 
-# IST (LTFM) bounding box for OpenSky
-IST_LAT, IST_LON = 40.976, 28.814
-OPENSKY_BBOX = {
-    'lamin': IST_LAT - 2.5,
-    'lomin': IST_LON - 2.5,
-    'lamax': IST_LAT + 2.5,
-    'lomax': IST_LON + 2.5,
-}
+AERODATABOX_BASE   = "https://prod.api.market/api/v1/aedbx/aerodatabox"
+
+# LHR bounding box for OpenSky (±2.5° around 51.477°N, -0.461°W)
+OPENSKY_BBOX = {"lamin": 48.977, "lomin": -2.961, "lamax": 53.977, "lomax": 2.039}
 
 
-def fetch_opensky_callsigns():
+def check_opensky_airborne(flight_iata):
     """
-    Fetch callsigns of aircraft currently airborne near IST from OpenSky Network.
-    Returns a set of normalised callsigns (uppercase, stripped).
-    Returns empty set on failure — gracefully degrades if OpenSky is unavailable.
+    Tiebreaker: check if a flight's callsign is currently airborne near LHR.
+    Returns True (airborne) / False (not detected) / None (OpenSky unavailable).
     """
     try:
-        url = "https://opensky-network.org/api/states/all"
-        resp = requests.get(url, params=OPENSKY_BBOX, timeout=10)
+        resp = requests.get(
+            "https://opensky-network.org/api/states/all",
+            params=OPENSKY_BBOX, timeout=10
+        )
         if resp.status_code != 200:
-            print(f"  ⚠️  OpenSky returned {resp.status_code} — skipping cross-validation")
-            return set()
-        data = resp.json()
-        states = data.get('states', []) or []
-        # state[1] is callsign (may be None or padded with spaces)
-        callsigns = set()
-        for state in states:
-            cs = state[1]
-            if cs:
-                callsigns.add(cs.strip().upper())
-        print(f"  🛰️  OpenSky: {len(callsigns)} aircraft airborne near IST")
-        return callsigns
+            print(f"  ⚠️  OpenSky returned {resp.status_code}")
+            return None
+        states = resp.json().get('states', []) or []
+        callsigns = {(s[1] or '').strip().upper() for s in states}
+        airborne = flight_iata.strip().upper() in callsigns
+        print(f"  🛰️  OpenSky tiebreaker for {flight_iata}: {'AIRBORNE ✈️' if airborne else 'NOT DETECTED 🚫'}")
+        return airborne
     except Exception as e:
-        print(f"  ⚠️  OpenSky unavailable ({e}) — skipping cross-validation")
-        return set()
+        print(f"  ⚠️  OpenSky unavailable: {e}")
+        return None
 
 
-def cross_validate(flight_iata, status, opensky_callsigns):
+def confirm_with_aerodatabox(flight_iata, scheduled_date):
     """
-    Cross-validate a disruption against OpenSky.
-
-    Logic:
-    - If OpenSky data is unavailable (empty set): confidence = 'unconfirmed'
-    - If flight is disrupted AND not airborne in OpenSky: confidence = 'high'
-    - If flight is disrupted BUT airborne in OpenSky: confidence = 'conflict'
-      (AviationStack says cancelled but plane is in the air — possible data lag)
-    - Scheduled flights: no cross-validation needed
+    Query AeroDataBox for the current status of a specific flight.
+    Returns: 'cancelled' | 'delayed' | 'scheduled' | 'active' | 'unknown'
+    Degrades gracefully to 'unknown' on any error.
     """
-    if not opensky_callsigns:
-        return 'unconfirmed'
+    if not AERODATABOX_KEY:
+        return 'unknown'
+    try:
+        url = f"{AERODATABOX_BASE}/flights/Number/{flight_iata}/{scheduled_date}"
+        headers = {"x-api-market-key": AERODATABOX_KEY}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 404:
+            return 'unknown'   # flight not in AeroDataBox
+        if resp.status_code != 200:
+            print(f"  ⚠️  AeroDataBox {resp.status_code} for {flight_iata}")
+            return 'unknown'
+        data = resp.json()
+        # AeroDataBox returns a list of flights (can include yesterday + today)
+        # Pick the one departing on scheduled_date
+        if isinstance(data, list):
+            today_flights = [
+                f for f in data
+                if scheduled_date in (f.get('departure', {}).get('scheduledTime', {}).get('utc', ''))
+            ]
+            data = today_flights[0] if today_flights else (data[-1] if data else {})
+        raw_status = (data.get('status') or '').lower()
+        # Normalise to our status vocabulary
+        if 'cancel' in raw_status:
+            return 'cancelled'
+        if 'delay' in raw_status:
+            return 'delayed'
+        if 'divert' in raw_status:
+            return 'diverted'
+        if raw_status in ('active', 'en-route', 'airborne', 'enroute'):
+            return 'active'
+        if raw_status in ('scheduled', 'expected', 'unknown'):
+            return 'scheduled'
+        if raw_status == 'arrived':
+            return 'arrived'   # yesterday's flight — caller treats as 'unknown'
+        return raw_status or 'unknown'
+    except Exception as e:
+        print(f"  ⚠️  AeroDataBox error for {flight_iata}: {e}")
+        return 'unknown'
 
-    if status not in DISRUPTED_STATUSES:
-        return 'ok'
 
-    iata_upper = flight_iata.strip().upper()
-    airborne = iata_upper in opensky_callsigns
+def cross_validate(flight_iata, av_status, scheduled_date):
+    """
+    Three-source validation pipeline:
+      Step 1 — AeroDataBox cross-check
+      Step 2 — OpenSky tiebreaker (only on conflict)
 
-    if airborne:
-        print(f"  ⚡ CONFLICT: {flight_iata} is {status.upper()} per AviationStack but AIRBORNE per OpenSky")
-        return 'conflict'
-    else:
-        return 'high'
+    Returns (confidence, sources) tuple.
+    """
+    if av_status not in DISRUPTED_STATUSES:
+        return 'ok', ['AviationStack']
+
+    adb_status = confirm_with_aerodatabox(flight_iata, scheduled_date)
+    print(f"  🔍 {flight_iata}: AviationStack={av_status.upper()} | AeroDataBox={adb_status.upper()}")
+
+    if adb_status in ('unknown', 'arrived'):
+        return 'unconfirmed', ['AviationStack']
+
+    if adb_status in DISRUPTED_STATUSES:
+        return 'high', ['AviationStack', 'AeroDataBox']
+
+    if adb_status in ('active', 'scheduled'):
+        # Conflict — call OpenSky as tiebreaker
+        print(f"  ⚡ CONFLICT: {flight_iata} — AviationStack={av_status.upper()} | AeroDataBox={adb_status.upper()} → calling OpenSky...")
+        airborne = check_opensky_airborne(flight_iata)
+
+        if airborne is True:
+            # All three sources give a verdict: flight is operating
+            print(f"  ✈️  OpenSky confirms {flight_iata} is AIRBORNE — overriding cancellation")
+            return 'conflict_operating', ['AviationStack', 'AeroDataBox', 'OpenSky']
+        elif airborne is False:
+            # AeroDataBox disagrees but OpenSky also sees nothing → support cancellation
+            print(f"  ✅ OpenSky silent for {flight_iata} — cancellation likely correct")
+            return 'confirmed', ['AviationStack', 'AeroDataBox', 'OpenSky']
+        else:
+            # OpenSky unavailable — stay as conflict
+            return 'conflict', ['AviationStack', 'AeroDataBox']
+
+    return 'unconfirmed', ['AviationStack']
 
 
 def fetch_live_status():
@@ -99,17 +155,19 @@ def fetch_live_status():
     watchlist_by_iata = {f['flight_iata']: f for f in watchlist}
     print(f"📋 Watchlist: {len(watchlist)} flight(s)")
 
-    # ── Fetch OpenSky first (cross-validation layer) ──────────────────────────
-    print("\n🛰️  Fetching OpenSky cross-validation data...")
-    opensky_callsigns = fetch_opensky_callsigns()
-    opensky_available = bool(opensky_callsigns)
+    today = datetime.now().strftime('%Y-%m-%d')
+    adb_available = bool(AERODATABOX_KEY)
+    print(f"\n{'🔍' if adb_available else '⚠️ '} AeroDataBox cross-validation: {'enabled' if adb_available else 'disabled (no key)'}")
 
-    # ── Fetch fresh AviationStack snapshot ───────────────────────────────────
+    # ── Fetch fresh AviationStack snapshot (general + cancelled) ─────────────
     print("\n🌐 Fetching AviationStack snapshot...")
     url = "http://api.aviationstack.com/v1/flights"
-    params = {"access_key": API_KEY, "dep_iata": "IST", "limit": 100}
-    response = requests.get(url, params=params)
-    live_data = response.json()
+    base_params = {"access_key": API_KEY, "dep_iata": "LHR"}
+    r1 = requests.get(url, params={**base_params, "limit": 80})
+    r2 = requests.get(url, params={**base_params, "flight_status": "cancelled", "limit": 20})
+    all_flights = r1.json().get('data', []) + r2.json().get('data', [])
+    live_data = {"data": all_flights}
+    print(f"   General feed: {len(r1.json().get('data', []))} | Cancelled feed: {len(r2.json().get('data', []))}")
 
     # Parse into dict, skip active/landed, deduplicate codeshares
     live_snapshot = {}
@@ -127,7 +185,8 @@ def fetch_live_status():
             continue
         seen_routes.add(route_key)
 
-        confidence = cross_validate(iata, status, opensky_callsigns)
+        # Cross-validate disrupted flights (AeroDataBox + OpenSky tiebreaker)
+        confidence, sources = cross_validate(iata, status, today)
 
         live_snapshot[iata] = {
             'flight_iata': iata,
@@ -139,7 +198,7 @@ def fetch_live_status():
             'delay':       flight['departure']['delay'],
             'processed':   False,
             'confidence':  confidence,
-            'sources':     ['AviationStack', 'OpenSky'] if opensky_available else ['AviationStack']
+            'sources':     sources,
         }
 
     print(f"   AviationStack: {len(live_snapshot)} relevant flight(s)\n")
@@ -194,7 +253,7 @@ def fetch_live_status():
     print(f"\n✅ Sync complete at {datetime.now().strftime('%H:%M:%S')}")
     print(f"   {changes} status change(s) | {departed} departed | {new_added} new flight(s)")
     print(f"   {len(updated_watchlist)} total flight(s) in watchlist")
-    print(f"   OpenSky cross-validation: {'active' if opensky_available else 'unavailable (graceful degradation)'}")
+    print(f"   AeroDataBox cross-validation: {'active' if adb_available else 'unavailable (no key)'}")
 
     # Confidence summary
     disrupted = [f for f in updated_watchlist if f.get('status') in DISRUPTED_STATUSES]
