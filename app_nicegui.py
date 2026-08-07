@@ -143,7 +143,9 @@ Use the passenger's first name naturally, not in every line. Use city names, not
 No markdown formatting. Keep responses concise and focused.
 Do not invent flight times or numbers not already provided.
 Never claim to be human or an AI. If asked, say warmly: "I'm Emma, and I'm here to help you."
-Never offer to transfer — you handle everything yourself."""
+If a passenger asks to speak with a human agent or a supervisor, acknowledge the request
+professionally and let them know you're connecting them now — do not argue or redirect them
+back to yourself."""
 
 def emma_call(prompt, history, airline="the airline"):
     system_prompt = CS_SYSTEM_TEMPLATE.format(airline=airline)
@@ -172,6 +174,13 @@ Reply with exactly one word: refund, rebook, voucher, or unclear."""
     )
     w = r["output"]["message"]["content"][0]["text"].strip().lower()
     return w if w in {"refund", "rebook", "voucher"} else "unknown"
+
+def wants_human(text):
+    t = text.lower()
+    return any(w in t for w in [
+        "human", "real person", "real agent", "speak to someone",
+        "supervisor", "manager", "not a bot", "not a robot", "talk to a person"
+    ])
 
 # ── App state (single-user POC) ───────────────────────────────────────────────
 
@@ -893,6 +902,31 @@ def main_page():
                                 ui.button("✈️ Rebook",          on_click=approve_rebook).style("background:#1a1a2e; color:#FFD700; border:1px solid #FFD700;")
                                 ui.button("🏨 Hotel Voucher",   on_click=approve_voucher).style("background:#2e1a2e; color:#FF88FF; border:1px solid #884488;")
 
+                    elif phase == "human_handoff":
+                        with ui.card().style("background:#2a1a1a; border:1px solid #FF4444; padding:16px; margin-top:12px;"):
+                            p = state["cs_passenger"]
+                            ui.html(f"""<b style='color:#FF4444;'>ESCALATION — HUMAN AGENT REQUESTED</b><br><br>
+                                <span style='color:#fff;'>Passenger: <b>{p['name']}</b></span><br>
+                                <span style='color:#fff;'>Flight: <b>{p['flight']}</b> → {p['destination']}</span><br>
+                                <span style='color:#fff;'>Requested: <b>{state['cs_choice'] or 'not yet specified'}</b></span><br><br>
+                                <span style='color:#aaa;font-size:13px;'>{state['cs_handoff']}</span>""")
+                            with ui.row().classes("gap-4 q-mt-md"):
+                                async def human_refund():
+                                    state["cs_choice"] = "refund"
+                                    state["cs_phase"]  = "approved"
+                                    await process_approved()
+                                async def human_rebook():
+                                    state["cs_choice"] = "rebook"
+                                    state["cs_phase"]  = "approved"
+                                    await process_approved()
+                                async def human_voucher():
+                                    state["cs_choice"] = "voucher"
+                                    state["cs_phase"]  = "approved"
+                                    await process_approved()
+                                ui.button("✅ Process Refund",  on_click=human_refund).style("background:#1a2e1a; color:#00CC66; border:1px solid #00CC66;")
+                                ui.button("✈️ Process Rebook",  on_click=human_rebook).style("background:#1a1a2e; color:#FFD700; border:1px solid #FFD700;")
+                                ui.button("🏨 Process Voucher", on_click=human_voucher).style("background:#2e1a2e; color:#FF88FF; border:1px solid #884488;")
+
                     elif phase == "complete":
                         ui.html("<p style='color:#888;font-family:monospace;margin-top:15px;'>— Call concluded. Flight marked as processed. —</p>")
 
@@ -900,6 +934,19 @@ def main_page():
                 p     = state["cs_passenger"]
                 phase = state["cs_phase"]
                 hist  = state["cs_messages"]
+
+                if wants_human(reply):
+                    state["cs_handoff"] = "Passenger explicitly requested a human agent."
+                    prompt = (f"The passenger asked to speak with a human agent. Acknowledge this "
+                              f"professionally and let {p['name'].split()[0]} know you're connecting "
+                              f"them now. Under 40 words.")
+                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
+                    try:   audio = await asyncio.to_thread(synth, text)
+                    except: audio = None
+                    state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
+                    state["cs_phase"] = "human_handoff"
+                    render_cs_conversation(text, audio)
+                    return
 
                 # ── Turn 1: first response ─────────────────────────────────
                 if phase == "turn1":
