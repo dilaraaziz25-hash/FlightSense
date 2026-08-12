@@ -9,17 +9,19 @@ Three-source validation logic:
   3. OpenSky        — transponder tiebreaker (only called on conflict)
 
 Confidence levels:
-  'high'        — AviationStack + AeroDataBox both confirm disruption
-  'conflict'    — sources disagree; OpenSky called as tiebreaker:
-                    airborne  → 'conflict_operating' (flight is flying, do NOT contact)
-                    silent    → 'confirmed' (transponder silent, treat as cancelled)
-  'unconfirmed' — AeroDataBox has no data; single source only
-  'ok'          — scheduled flight, no validation needed
+  'high'             — AviationStack + AeroDataBox both confirm disruption
+  'conflict'         — sources disagree; OpenSky called as tiebreaker:
+                         airborne  → 'conflict_operating' (flight is flying, do NOT contact)
+                         silent    → 'confirmed' (transponder silent, treat as cancelled)
+  'unconfirmed'      — AeroDataBox has no data; single source only
+  'ok'               — scheduled/active flight, AeroDataBox confirms operating
+  'ok_unconfirmed'   — scheduled/active, departing within 2h but AeroDataBox has no data
+  'ok_not_checked'   — scheduled/active, departure > 2h away (not worth checking yet)
 """
 import requests
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -104,16 +106,41 @@ def confirm_with_aerodatabox(flight_iata, scheduled_date):
         return 'unknown'
 
 
-def cross_validate(flight_iata, av_status, scheduled_date):
+def cross_validate(flight_iata, av_status, scheduled_date, scheduled_time=None):
     """
     Three-source validation pipeline:
       Step 1 — AeroDataBox cross-check
       Step 2 — OpenSky tiebreaker (only on conflict)
 
+    For non-disrupted flights, only validates if departure is within 2 hours
+    (to conserve AeroDataBox API quota).
+
     Returns (confidence, sources) tuple.
     """
     if av_status not in DISRUPTED_STATUSES:
-        return 'ok', ['AviationStack']
+        # Only cross-check non-disrupted flights departing within 2 hours
+        if scheduled_time:
+            try:
+                dep = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+                now = datetime.now(timezone.utc)
+                mins_until = (dep - now).total_seconds() / 60
+                if mins_until > 120 or mins_until < -30:
+                    return 'ok_not_checked', ['AviationStack']
+            except Exception:
+                return 'ok_not_checked', ['AviationStack']
+        else:
+            return 'ok_not_checked', ['AviationStack']
+
+        # Within 2h window — check AeroDataBox
+        adb_status = confirm_with_aerodatabox(flight_iata, scheduled_date)
+        print(f"  🔍 {flight_iata} (non-disrupted): AviationStack={av_status.upper()} | AeroDataBox={adb_status.upper()}")
+        if adb_status in ('unknown', 'arrived'):
+            return 'ok_unconfirmed', ['AviationStack']
+        if adb_status in DISRUPTED_STATUSES:
+            # AeroDataBox sees a disruption that AviationStack missed!
+            print(f"  🚨 {flight_iata}: AeroDataBox reports {adb_status.upper()} — AviationStack missed it!")
+            return 'unconfirmed', ['AeroDataBox']
+        return 'ok', ['AviationStack', 'AeroDataBox']
 
     adb_status = confirm_with_aerodatabox(flight_iata, scheduled_date)
     print(f"  🔍 {flight_iata}: AviationStack={av_status.upper()} | AeroDataBox={adb_status.upper()}")
@@ -185,8 +212,9 @@ def fetch_live_status():
             continue
         seen_routes.add(route_key)
 
-        # Cross-validate disrupted flights (AeroDataBox + OpenSky tiebreaker)
-        confidence, sources = cross_validate(iata, status, today)
+        # Cross-validate all flights — disrupted fully, non-disrupted within 2h window
+        scheduled_time = flight['departure']['scheduled']
+        confidence, sources = cross_validate(iata, status, today, scheduled_time)
 
         live_snapshot[iata] = {
             'flight_iata': iata,
@@ -231,10 +259,9 @@ def fetch_live_status():
             changes += 1
         else:
             flight['delay']      = live['delay']
-            # Refresh confidence on existing disruptions too
-            if new_status in DISRUPTED_STATUSES:
-                flight['confidence'] = live['confidence']
-                flight['sources']    = live['sources']
+            # Refresh confidence for all flights (disrupted and non-disrupted)
+            flight['confidence'] = live['confidence']
+            flight['sources']    = live['sources']
 
         updated_watchlist.append(flight)
 

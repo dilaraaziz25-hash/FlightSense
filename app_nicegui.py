@@ -71,6 +71,27 @@ def check_long_haul(origin, dest):
     dist = haversine(o["lat"], o["lon"], d["lat"], d["lon"])
     return dist > LONG_HAUL_KM, round(dist)
 
+def generate_rebooking(original_flight_iata):
+    """Deterministic replacement flight so Emma has a real flight number/time
+    to reference — never invented on the fly, computed once and reused."""
+    prefix = "".join(ch for ch in original_flight_iata if ch.isalpha())
+    digits = "".join(ch for ch in original_flight_iata if ch.isdigit())
+    try:
+        new_flight = f"{prefix}{int(digits) + 1:0{len(digits)}d}"
+    except Exception:
+        new_flight = f"{prefix}{digits}R"
+    departure = (datetime.datetime.now() + datetime.timedelta(days=1)).replace(
+        hour=9, minute=15, second=0, microsecond=0
+    )
+    return {"flight_iata": new_flight, "departure": departure.strftime("%A, %B %d at %I:%M %p")}
+
+def get_rebooking(passenger):
+    """Get-or-create this call's rebooking details, cached in state so every
+    turn references the exact same flight/time rather than inventing one."""
+    if not state.get("cs_rebooking_details"):
+        state["cs_rebooking_details"] = generate_rebooking(passenger["flight"])
+    return state["cs_rebooking_details"]
+
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
 def load_flights():
@@ -111,7 +132,7 @@ def mark_processed(flight_iata):
     except Exception as e:
         ui.notify(f"Could not mark processed: {e}", type="negative")
 
-def write_log(flight_iata, status, airline, destination, resolution):
+def write_log(flight_iata, status, airline, destination, resolution, transcript=None):
     entry = {
         "flight_iata":    flight_iata,
         "airline":        airline,
@@ -120,6 +141,7 @@ def write_log(flight_iata, status, airline, destination, resolution):
         "affected_count": 1,
         "resolution":     resolution,
         "timestamp":      str(datetime.datetime.now()),
+        "transcript":     transcript or [],
     }
     logs = load_logs()
     logs.append(entry)
@@ -128,12 +150,34 @@ def write_log(flight_iata, status, airline, destination, resolution):
 
 # ── Polly ─────────────────────────────────────────────────────────────────────
 
-def synth(text):
-    r = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Amy", Engine="neural")
+def synth(text, voice_id="Amy", engine="neural"):
+    r = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId=voice_id, Engine=engine)
     return r["AudioStream"].read()
 
 def audio_b64(audio_bytes):
     return base64.b64encode(audio_bytes).decode()
+
+# ── Passenger-preferred language ────────────────────────────────────────────
+# (Turkish included since FlightSense's demo airline is Turkish Airlines)
+LANGUAGE_VOICES = {
+    "English":    ("Amy",    "neural"),
+    "Spanish":    ("Lucia",  "neural"),
+    "French":     ("Lea",    "neural"),
+    "German":     ("Vicki",  "neural"),
+    "Italian":    ("Bianca", "neural"),
+    "Portuguese": ("Ines",   "standard"),
+    "Turkish":    ("Filiz",  "standard"),
+}
+
+def synth_for_state(text):
+    """Synthesize using the voice/engine matching the passenger's selected language."""
+    voice_id, engine = LANGUAGE_VOICES.get(state.get("cs_language", "English"), ("Amy", "neural"))
+    return synth(text, voice_id, engine)
+
+async def emma_say(prompt, history, airline):
+    """Call Emma using the passenger's currently selected language."""
+    language = state.get("cs_language", "English")
+    return await asyncio.to_thread(emma_call, prompt, history, airline, language)
 
 # ── Emma (Bedrock) ────────────────────────────────────────────────────────────
 
@@ -145,10 +189,11 @@ Do not invent flight times or numbers not already provided.
 Never claim to be human or an AI. If asked, say warmly: "I'm Emma, and I'm here to help you."
 If a passenger asks to speak with a human agent or a supervisor, acknowledge the request
 professionally and let them know you're connecting them now — do not argue or redirect them
-back to yourself."""
+back to yourself.
+Respond only in {language}, regardless of what language the passenger writes in."""
 
-def emma_call(prompt, history, airline="the airline"):
-    system_prompt = CS_SYSTEM_TEMPLATE.format(airline=airline)
+def emma_call(prompt, history, airline="the airline", language="English"):
+    system_prompt = CS_SYSTEM_TEMPLATE.format(airline=airline, language=language)
     msgs = history + [{"role": "user", "content": [{"text": prompt}]}]
     r = bedrock.converse(
         modelId=MODEL_ID,
@@ -192,6 +237,10 @@ state = {
     "cs_choice":      "",
     "cs_handoff":     "",
     "cs_distance_km": 0,
+    "cs_language":    "English",
+    "cs_force_recall_pnr": None,
+    "cs_stop_requested": False,
+    "cs_rebooking_details": None,
 }
 
 # ── NiceGUI page ──────────────────────────────────────────────────────────────
@@ -440,7 +489,15 @@ def main_page():
                 elif status == "departed":
                     note_html = '<span style="color:#888;font-size:12px;">🛫 departed</span>'
                 else:
-                    note_html = ""
+                    # Non-disrupted flights — show 2-source confirmation if checked
+                    if effective_conf == "ok" and len(fl.get("sources", [])) >= 2:
+                        note_html = '<span class="badge-high">✅ 2-source confirmed</span>'
+                    elif effective_conf == "ok_unconfirmed":
+                        note_html = '<span class="badge-single">⚠ 1-source</span>'
+                    elif effective_conf == "unconfirmed" and "AeroDataBox" in fl.get("sources", []):
+                        note_html = '<span style="color:#FF4444;font-size:13px;">🚨 ADB flags disruption!</span>'
+                    else:
+                        note_html = ""
 
                 sched = fl.get("scheduled", "")
                 sched = sched[11:16] if len(sched) >= 16 else sched
@@ -698,6 +755,19 @@ def main_page():
                   <span style='color:#888;font-family:monospace;font-size:12px;'>{log['timestamp']}</span>
                 </div>""")
 
+                transcript = log.get("transcript") or []
+                if transcript:
+                    with ui.expansion("💬 View conversation", icon="chat").style(
+                        "background:#12121a; color:#ccc; font-family:monospace; "
+                        "font-size:13px; margin:-4px 0 10px; border-radius:5px;"
+                    ):
+                        for m in transcript:
+                            who   = "🎧 Emma" if m["role"] == "assistant" else "🧑 Passenger"
+                            color = "#FFD700" if m["role"] == "assistant" else "#888"
+                            ui.html(f"""<div style='padding:4px 8px;'>
+                                <span style='color:{color};'>{who}:</span>
+                                <span style='color:#ddd;'>{m['text']}</span></div>""")
+
     # ── CS Tab (most complex) ─────────────────────────────────────────────────
 
     def render_tab3():
@@ -734,11 +804,68 @@ def main_page():
             names = [f"{'✓ ' if c['processed'] else ''}{c['pnr']} — {c['name']} ({c['flight']} → {c['destination']})"
                      for c in candidates]
 
+            # After "New Call", default the selector to the passenger just being re-called
+            # (not just the first item in the list) so the override is actually visible
+            default_value = names[0]
+            recall_pnr = state.get("cs_force_recall_pnr")
+            if recall_pnr:
+                for i, c in enumerate(candidates):
+                    if c["pnr"] == recall_pnr:
+                        default_value = names[i]
+                        break
+
             # Controls row
             with ui.row().classes("items-center gap-4 q-mb-md"):
-                sel = ui.select(names, value=names[0]).style(
+                sel = ui.select(names, value=default_value).style(
                     "min-width:380px; font-family:monospace; background:#1a1a2e; color:#fff;"
                 )
+
+                lang_sel = ui.select(list(LANGUAGE_VOICES.keys()),
+                                      value=state.get("cs_language", "English"),
+                                      label="Language").style(
+                    "min-width:130px; font-family:monospace; background:#1a1a2e; color:#fff;"
+                )
+
+                def on_lang_change():
+                    state["cs_language"] = lang_sel.value
+                lang_sel.on_value_change(on_lang_change)
+
+                processed_note = ui.label("").style(
+                    "color:#888; font-family:monospace; font-size:12px;"
+                )
+
+                def on_pnr_change():
+                    idx = names.index(sel.value)
+                    cand = candidates[idx]
+
+                    forced = state.get("cs_force_recall_pnr") == cand["pnr"]
+
+                    # Grey out the selector + block Start Call for an already-processed PNR —
+                    # unless New Call explicitly asked to re-contact this exact passenger
+                    if cand["processed"] and not forced:
+                        sel.style("min-width:380px; font-family:monospace; background:#1a1a2e; color:#666;")
+                        processed_note.set_text("✓ Already processed for this PNR")
+                        start_btn.disable()
+                    elif cand["processed"] and forced:
+                        sel.style("min-width:380px; font-family:monospace; background:#1a1a2e; color:#fff;")
+                        processed_note.set_text("⚠ Already processed — calling again")
+                        if state["cs_phase"] == "idle":
+                            start_btn.enable()
+                    else:
+                        sel.style("min-width:380px; font-family:monospace; background:#1a1a2e; color:#fff;")
+                        processed_note.set_text("")
+                        if state["cs_phase"] == "idle":
+                            start_btn.enable()
+
+                    # Selecting a different PNR clears out a finished conversation
+                    current_pnr = state["cs_passenger"]["pnr"] if state["cs_passenger"] else None
+                    if state["cs_phase"] == "complete" and cand["pnr"] != current_pnr:
+                        state["cs_phase"]     = "idle"
+                        state["cs_passenger"] = None
+                        state["cs_messages"]  = []
+                        state["cs_choice"]    = ""
+                        state["cs_handoff"]   = ""
+                        conv_area.clear()
 
                 async def start_call():
                     idx = names.index(sel.value)
@@ -761,26 +888,31 @@ def main_page():
                     state["cs_messages"]  = []
                     state["cs_choice"]    = ""
                     state["cs_handoff"]   = ""
+                    state["cs_force_recall_pnr"]    = None
+                    state["cs_stop_requested"]      = False
+                    state["cs_rebooking_details"]   = None
 
                     prompt = (f"You are calling {p['name']} (PNR: {p['pnr']}). "
                               f"Their flight {p['flight']} to {p['destination']} with {p['airline']} is {p['status']}. "
                               f"Greet them warmly by first name. Inform them of the disruption with genuine empathy. "
                               f"Ask if it is a good time to talk. Under 80 words.")
 
-                    text = await asyncio.to_thread(emma_call, prompt, [], p['airline'])
+                    text = await emma_say(prompt, [], p['airline'])
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                     try:
-                        audio = await asyncio.to_thread(synth, text)
+                        audio = await asyncio.to_thread(synth_for_state, text)
                     except:
                         audio = None
                     state["cs_phase"] = "turn1"
                     render_cs_conversation(text, audio)
 
                 def new_call():
+                    recall_pnr = state["cs_passenger"]["pnr"] if state["cs_passenger"] else None
                     state["cs_phase"]     = "idle"
                     state["cs_passenger"] = None
                     state["cs_messages"]  = []
                     state["cs_choice"]    = ""
+                    state["cs_force_recall_pnr"] = recall_pnr
                     render_tab3()
 
                 start_btn = ui.button("📞 Start Call", on_click=start_call).style(
@@ -796,6 +928,9 @@ def main_page():
             # Conversation area
             conv_area = ui.column().classes("w-full")
 
+            sel.on_value_change(on_pnr_change)
+            on_pnr_change()  # initialize processed/disabled state for the default selection
+
             def render_cs_conversation(new_emma_text=None, new_audio=None):
                 conv_area.clear()
                 with conv_area:
@@ -810,12 +945,13 @@ def main_page():
                             <span style='color:{color};font-family:monospace;font-size:12px;'>{tag}</span><br><br>
                             <span style='font-size:15px;'>{txt}</span></div>""")
 
-                    # Play audio for the latest Emma turn
-                    if new_audio:
+                    # Play audio for the latest Emma turn — unless Stop was pressed while
+                    # this turn was already being generated in the background
+                    if new_audio and not state.get("cs_stop_requested"):
                         b64 = audio_b64(new_audio)
                         ui.run_javascript(f"""
-                            const a = new Audio('data:audio/mp3;base64,{b64}');
-                            a.play().catch(()=>{{}});
+                            window.__emmaAudio = new Audio('data:audio/mp3;base64,{b64}');
+                            window.__emmaAudio.play().catch(()=>{{}});
                         """)
 
                     phase = state["cs_phase"]
@@ -837,6 +973,7 @@ def main_page():
                                 reply = reply_input.value.strip()
                                 if not reply:
                                     return
+                                state["cs_stop_requested"] = False
                                 # Keep text visible while Emma is thinking — clear only once reply arrives
                                 state["cs_messages"].append({"role": "user", "content": [{"text": reply}]})
                                 await process_reply(reply)
@@ -875,6 +1012,19 @@ def main_page():
                             ui.button("🎙️ Mic", on_click=use_mic).style(
                                 "background:#2a1a2e; color:#FF88FF; border:1px solid #884488; font-family:monospace;"
                             ).tooltip("Click, then speak — transcript appears in the text box")
+
+                            async def stop_emma():
+                                state["cs_stop_requested"] = True
+                                await ui.run_javascript("""
+                                    if (window.__emmaAudio) {
+                                        window.__emmaAudio.pause();
+                                        window.__emmaAudio.currentTime = 0;
+                                    }
+                                """)
+
+                            ui.button("🛑 Stop", on_click=stop_emma).style(
+                                "background:#2a1a1a; color:#FF6666; border:1px solid #883333; font-family:monospace;"
+                            ).tooltip("Immediately silence Emma's voice — for testing")
 
                     elif phase == "approval":
                         with ui.card().style("background:#2a1a1a; border:1px solid #FF4444; padding:16px; margin-top:12px;"):
@@ -940,8 +1090,8 @@ def main_page():
                     prompt = (f"The passenger asked to speak with a human agent. Acknowledge this "
                               f"professionally and let {p['name'].split()[0]} know you're connecting "
                               f"them now. Under 40 words.")
-                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                    try:   audio = await asyncio.to_thread(synth, text)
+                    text  = await emma_say(prompt, hist, p['airline'])
+                    try:   audio = await asyncio.to_thread(synth_for_state, text)
                     except: audio = None
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                     state["cs_phase"] = "human_handoff"
@@ -951,13 +1101,17 @@ def main_page():
                 # ── Turn 1: first response ─────────────────────────────────
                 if phase == "turn1":
                     prompt = (f'The passenger said: "{reply}"\n'
-                              "Offer 3 clear numbered options (no markdown, no bold):\n"
-                              "1. Rebook on the next available flight at no extra cost\n"
-                              "2. Full refund to original payment method within 5-7 business days\n"
-                              "3. Hotel accommodation tonight and rebook on tomorrow's flight, all covered\n"
+                              "Offer exactly 3 numbered options, and make sure all 3 are clearly distinct — "
+                              "never repeat the same flight, time, or detail across two options:\n"
+                              "1. Rebook on the next available flight, at no extra cost. Do NOT state a "
+                              "specific time or flight number — none has been provided.\n"
+                              "2. Full refund to original payment method, processed within 5-7 business days.\n"
+                              "3. A hotel stay tonight, fully covered, with rebooking on a later flight. "
+                              "Present this only as the overnight-stay alternative to option 1 — do not "
+                              "restate option 1's flight details here.\n"
                               "Ask which option they prefer. Under 100 words.")
-                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                    try:   audio = await asyncio.to_thread(synth, text)
+                    text  = await emma_say(prompt, hist, p['airline'])
+                    try:   audio = await asyncio.to_thread(synth_for_state, text)
                     except: audio = None
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                     state["cs_phase"] = "turn2"
@@ -980,8 +1134,8 @@ def main_page():
                             state["cs_handoff"] = "Requires approval: " + " and ".join(reasons) + "."
                             prompt = (f"The passenger requested a refund. Requires supervisor approval ({' and '.join(reasons)}). "
                                       f"Tell {p['name'].split()[0]} warmly you are escalating — standard procedure. Under 60 words.")
-                            text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                            try:   audio = await asyncio.to_thread(synth, text)
+                            text  = await emma_say(prompt, hist, p['airline'])
+                            try:   audio = await asyncio.to_thread(synth_for_state, text)
                             except: audio = None
                             state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                             state["cs_phase"] = "approval"
@@ -989,28 +1143,36 @@ def main_page():
                         else:
                             prompt = (f"Confirm the refund for {p['name'].split()[0]}. "
                                       "5-7 business days to original payment method. Warm and brief. Do NOT say goodbye yet. Under 60 words.")
-                            text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                            try:   audio = await asyncio.to_thread(synth, text)
+                            text  = await emma_say(prompt, hist, p['airline'])
+                            try:   audio = await asyncio.to_thread(synth_for_state, text)
                             except: audio = None
                             state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                             state["cs_phase"] = "turn3"
                             render_cs_conversation(text, audio)
 
                     elif choice == "rebook":
+                        rb = get_rebooking(p)
                         prompt = (f"Confirm rebooking to {p['destination']} for {p['name'].split()[0]}. "
-                                  "Next available flight, confirmation email shortly. Do NOT say goodbye yet. Under 60 words.")
-                        text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                        try:   audio = await asyncio.to_thread(synth, text)
+                                  f"Your FIRST sentence must literally state: \"You're now booked on flight "
+                                  f"{rb['flight_iata']}, departing {rb['departure']}.\" Then, in your own words, "
+                                  "mention a confirmation email will follow shortly. Do NOT say goodbye yet. "
+                                  "Under 70 words.")
+                        text  = await emma_say(prompt, hist, p['airline'])
+                        try:   audio = await asyncio.to_thread(synth_for_state, text)
                         except: audio = None
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                         state["cs_phase"] = "turn3"
                         render_cs_conversation(text, audio)
 
                     elif choice == "voucher":
-                        prompt = (f"Confirm hotel voucher tonight and rebooking tomorrow to {p['destination']} for {p['name'].split()[0]}. "
-                                  "All costs covered by the airline. Do NOT say goodbye yet. Under 60 words.")
-                        text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                        try:   audio = await asyncio.to_thread(synth, text)
+                        rb = get_rebooking(p)
+                        prompt = (f"Confirm hotel voucher tonight and rebooking to {p['destination']} for "
+                                  f"{p['name'].split()[0]}. Their new flight is {rb['flight_iata']}, "
+                                  f"departing {rb['departure']}. State the new flight number and departure "
+                                  "time clearly. All costs covered by the airline. Do NOT say goodbye yet. "
+                                  "Under 80 words.")
+                        text  = await emma_say(prompt, hist, p['airline'])
+                        try:   audio = await asyncio.to_thread(synth_for_state, text)
                         except: audio = None
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                         state["cs_phase"] = "turn3"
@@ -1018,24 +1180,36 @@ def main_page():
 
                     else:
                         text  = "Sorry — could you clarify? Would you like a refund, to be rebooked on the next flight, or a hotel voucher tonight with rebooking tomorrow?"
-                        try:   audio = await asyncio.to_thread(synth, text)
+                        try:   audio = await asyncio.to_thread(synth_for_state, text)
                         except: audio = None
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                         render_cs_conversation(text, audio)
 
                 # ── Turn 3: closing ────────────────────────────────────────
                 elif phase == "turn3":
-                    prompt = (f"Close the call warmly with {p['name'].split()[0]}. "
-                              "Apologise once more for the inconvenience, wish them well, say a warm goodbye. Under 50 words.")
-                    text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                    try:   audio = await asyncio.to_thread(synth, text)
+                    rb = state.get("cs_rebooking_details")
+                    details_note = (
+                        f" If they ask about their new flight, the confirmed details are: flight "
+                        f"{rb['flight_iata']}, departing {rb['departure']} — state these confidently, "
+                        f"you already told them this earlier in the call."
+                    ) if rb else ""
+                    prompt = (f'The passenger said: "{reply}"\n'
+                              f"If this is a genuine question, answer it directly and accurately using "
+                              f"what's already been discussed in this call.{details_note} If they are simply "
+                              "acknowledging, thanking you, or indicating they're finished, close the call "
+                              "warmly instead: apologise once more for the inconvenience, wish them well, "
+                              "and say a warm goodbye. Under 70 words.")
+                    text  = await emma_say(prompt, hist, p['airline'])
+                    try:   audio = await asyncio.to_thread(synth_for_state, text)
                     except: audio = None
                     state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
 
                     mark_processed(p["flight"])
-                    write_log(p["flight"], p["status"], p["airline"], p["dest_iata"], state["cs_choice"])
+                    transcript = [{"role": m["role"], "text": m["content"][0]["text"]} for m in state["cs_messages"]]
+                    write_log(p["flight"], p["status"], p["airline"], p["dest_iata"], state["cs_choice"], transcript)
                     state["cs_phase"] = "complete"
                     render_cs_conversation(text, audio)
+                    render_tab3()
                     refresh_tab1_tab2()
                     render_tab4()
                     render_tab5()
@@ -1048,12 +1222,21 @@ def main_page():
                 if choice == "refund":
                     prompt = f"The supervisor approved the refund for {p['name'].split()[0]}. Confirm warmly — refund approved, 5-7 business days. Do NOT say goodbye yet. Under 60 words."
                 elif choice == "rebook":
-                    prompt = f"The supervisor rebooked {p['name'].split()[0]} on the next flight to {p['destination']}. Confirm warmly, mention confirmation email. Do NOT say goodbye yet. Under 60 words."
+                    rb = get_rebooking(p)
+                    prompt = (f"The supervisor rebooked {p['name'].split()[0]} to {p['destination']}. "
+                              f"Your FIRST sentence must literally state: \"You're now booked on flight "
+                              f"{rb['flight_iata']}, departing {rb['departure']}.\" Then, in your own words, "
+                              "mention a confirmation email will follow shortly. Do NOT say goodbye yet. "
+                              "Under 70 words.")
                 else:
-                    prompt = f"Hotel voucher and rebooking tomorrow to {p['destination']} for {p['name'].split()[0]} all arranged. Confirm warmly, all costs covered. Do NOT say goodbye yet. Under 60 words."
+                    rb = get_rebooking(p)
+                    prompt = (f"Hotel voucher tonight and rebooking to {p['destination']} for "
+                              f"{p['name'].split()[0]} all arranged — their new flight is {rb['flight_iata']}, "
+                              f"departing {rb['departure']}. Confirm warmly, state the new flight number and "
+                              "departure time clearly, all costs covered. Do NOT say goodbye yet. Under 80 words.")
 
-                text  = await asyncio.to_thread(emma_call, prompt, hist, p['airline'])
-                try:   audio = await asyncio.to_thread(synth, text)
+                text  = await emma_say(prompt, hist, p['airline'])
+                try:   audio = await asyncio.to_thread(synth_for_state, text)
                 except: audio = None
                 state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                 state["cs_phase"] = "turn3"

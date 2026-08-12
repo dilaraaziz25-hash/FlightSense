@@ -1,6 +1,23 @@
-anthropic
-requests
-streamlit
-folium
-streamlit-folium
-python-dotenv
+# FlightSense — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# AWS
+boto3>=1.34.0
+
+# UI
+nicegui>=1.4.0
+
+# Airport data
+airportsdata>=20240101
+
+# HTTP
+requests>=2.31.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# LangGraph (CS agent state machine)
+langgraph>=0.1.0
+
+# Testing
+pytest>=8.0.0
