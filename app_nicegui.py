@@ -17,6 +17,9 @@ import os
 import subprocess
 import sys
 
+import random
+import string
+
 import boto3
 import airportsdata
 from dotenv import load_dotenv
@@ -400,7 +403,7 @@ def main_page():
 
     with ui.tabs().classes("w-full") as tabs:
         t1 = ui.tab("✈️  FLIGHT MONITOR")
-        t2 = ui.tab("🚨  AFFECTED PASSENGERS")
+        t2 = ui.tab("🎫  BOOKING")
         t3 = ui.tab("📞  CUSTOMER SERVICE")
         t4 = ui.tab("📊  ANALYTICS")
         t5 = ui.tab("📋  DISRUPTION LOG")
@@ -411,8 +414,8 @@ def main_page():
         with ui.tab_panel(t1):
             t1_container = ui.column().classes("w-full q-pa-md")
 
-        # ── Tab 2: Affected Passengers ────────────────────────────────────────
-        with ui.tab_panel(t2):
+        # ── Tab 2: Booking ────────────────────────────────────────────────────
+        with ui.tab_panel(t2).style("background: linear-gradient(160deg, #122040 0%, #1a3060 50%, #0f1c3a 100%); min-height:100vh;"):
             t2_container = ui.column().classes("w-full q-pa-md")
 
         # ── Tab 3: Customer Service ───────────────────────────────────────────
@@ -547,33 +550,628 @@ def main_page():
             if not state["data_loaded"]:
                 ui.html(WAITING); return
             flights    = load_flights()
-            passengers = load_passengers()
-            affected   = []
-            for pnr, p in passengers.items():
-                fi = next((f for f in flights if f["flight_iata"] == p["flight_iata"]), None)
-                if fi and fi["status"] in DISRUPTED:
-                    affected.append({"pnr": pnr, "name": p["passenger_name"],
-                                     "flight": p["flight_iata"], "dest": p["destination"],
-                                     "status": fi["status"], "processed": fi.get("processed", False),
-                                     "airline": fi.get("airline", ""),
-                                     "cabin": p.get("cabin_class", "economy"),
-                                     "fare": p.get("fare_amount", 0)})
-            if not affected:
-                ui.html("<p style='color:#00FF00;font-family:monospace;'>✅ No affected passengers.</p>")
-                return
-            ui.label(f"{len(affected)} passenger(s) on disrupted flights").style("color:#fff;font-family:monospace;")
-            ui.separator().style("border-color:#333; margin:8px 0;")
-            for p in affected:
-                border = "#888" if p["processed"] else "#FF4444"
-                proc_t = " &nbsp;<span style='color:#888;font-size:11px;'>✓ CS done</span>" if p["processed"] else ""
-                ui.html(f"""
-                <div style='background:#1a1a2e;border-left:4px solid {border};padding:12px;margin:6px 0;border-radius:5px;'>
-                  <span style='color:#FFD700;font-family:monospace;font-weight:bold;'>{p['pnr']}</span>
-                  <span style='color:#fff;font-family:monospace;'> — {p['name']}</span>
-                  <span style='color:#aaa;font-family:monospace;font-size:13px;'> | {p['flight']} → {get_city(p['dest'])} | {p['airline']}</span>
-                  <span style='color:#FF4444;font-family:monospace;font-size:12px;'> [{p['status'].upper()}]</span>{proc_t}<br>
-                  <span style='color:#aaa;font-family:monospace;font-size:12px;'>{p['cabin'].replace('_',' ').title()} — ${p['fare']}</span>
-                </div>""")
+            flight_map = {f["flight_iata"]: f for f in flights}
+
+            STATUS_COLORS = {
+                "cancelled": "#FF4444", "delayed": "#FF8800", "diverted": "#CC44FF",
+                "incident": "#FF4444", "active": "#00CC66", "scheduled": "#4488FF",
+                "departed": "#888888",
+            }
+
+            def flight_label(f):
+                dest  = get_city(f.get("destination", ""))
+                sched = f.get("scheduled", "")
+                try:
+                    t = datetime.datetime.fromisoformat(sched.replace("Z", "+00:00")).strftime("%H:%M")
+                except Exception:
+                    t = "--:--"
+                return f"{f['flight_iata']}  →  {dest}  {t}  [{f['status'].upper()}]"
+
+            status_order = {"scheduled": 0, "active": 1, "delayed": 2,
+                            "diverted": 3, "cancelled": 4, "departed": 5}
+            sorted_flights = sorted(
+                flights,
+                key=lambda f: (status_order.get(f["status"], 9), f.get("scheduled", ""))
+            )
+            all_flight_options = {flight_label(f): f["flight_iata"] for f in sorted_flights}
+
+            def generate_pnr(existing_pnrs):
+                while True:
+                    pnr = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+                    if pnr not in existing_pnrs:
+                        return pnr
+
+            # ── Centred outer wrapper ─────────────────────────────────────────
+            with ui.column().classes("items-center w-full"):
+
+                # ── Header row: title + refresh ───────────────────────────────
+                with ui.row().classes("items-center justify-between w-full").style("max-width:780px; margin-bottom:16px;"):
+                    ui.label("New Booking").style(
+                        "color:#FFD700; font-family:monospace; font-size:20px; font-weight:bold;"
+                    )
+                    ui.button("🔄 Refresh Flights", on_click=render_tab2).style(
+                        "background:transparent; color:#888; border:1px solid #444; "
+                        "font-family:monospace; font-size:12px;"
+                    )
+
+                # ── Shared constants ───────────────────────────────────────────
+                CABIN_FARES = {"Economy": 499, "Business": 1799, "First": 5999}
+                FX_RATES    = {"GBP": 1.0, "USD": 1.27, "EUR": 1.18}
+                FS = "font-family:monospace; background:#0a1628; color:#d8e8ff; border:1px solid #2a4060;"
+                STATUS_CHIP_COLOR = {
+                    "cancelled":"#FF4444","delayed":"#FF8800","diverted":"#CC44FF",
+                    "incident":"#FF4444","active":"#00CC66","scheduled":"#4a90d9","departed":"#666666",
+                }
+
+                # ── Booking state (shared across steps) ────────────────────────
+                bk = {
+                    "trip_type": "One Way",
+                    "pax_counts": {"Adult": 1, "Children": 0, "Infant": 0},
+                    "cabin": "Economy",
+                    "dest_iata": None,
+                    "flight_key": None,
+                    "flight_iata": None,
+                    "dep_date": "",
+                    "ret_date": "",
+                    "dep_time": "",
+                    "curr_sym": "£",
+                    "curr_code": "GBP",
+                }
+
+                def converted_fare():
+                    base = CABIN_FARES.get(bk["cabin"], 499)
+                    rate = FX_RATES.get(bk["curr_code"], 1.0)
+                    return round(base * rate)
+
+                def total_pax():
+                    return sum(bk["pax_counts"].values()) or 1
+
+                def pax_summary():
+                    parts = []
+                    if bk["pax_counts"]["Adult"]:    parts.append(f"{bk['pax_counts']['Adult']} Adult{'s' if bk['pax_counts']['Adult']>1 else ''}")
+                    if bk["pax_counts"]["Children"]: parts.append(f"{bk['pax_counts']['Children']} Child{'ren' if bk['pax_counts']['Children']>1 else ''}")
+                    if bk["pax_counts"]["Infant"]:   parts.append(f"{bk['pax_counts']['Infant']} Infant{'s' if bk['pax_counts']['Infant']>1 else ''}")
+                    return ", ".join(parts) if parts else "1 Adult"
+
+                # ── Step containers ────────────────────────────────────────────
+                step1_card = ui.card().style(
+                    "background:#0d1e36; border:1px solid #2a4060; padding:28px 32px; "
+                    "border-radius:12px; width:100%; max-width:820px;"
+                )
+                step2_area = ui.column().style("width:100%; max-width:820px;")
+                confirm_area = ui.column().style("width:100%; max-width:820px;")
+                step2_area.set_visibility(False)
+
+                # ══════════════════════════════════════════════════════════════
+                # STEP 1 — Select flight
+                # ══════════════════════════════════════════════════════════════
+                with step1_card:
+                    # ── Trip type + Passengers ────────────────────────────────
+                    pax_btn_label = {"el": None}
+                    return_date_row = None  # forward ref
+
+                    with ui.row().classes("gap-3 items-center").style("margin-bottom:16px; flex-wrap:wrap;"):
+                        inp_trip = ui.select(["One Way", "Return"], value="One Way", label="Trip Type"
+                            ).props("outlined dense").style(f"{FS} min-width:130px;")
+
+                        def on_trip_change():
+                            bk["trip_type"] = inp_trip.value
+                            if return_date_row:
+                                return_date_row.set_visibility(inp_trip.value == "Return")
+                        inp_trip.on_value_change(on_trip_change)
+
+                        with ui.element("div"):
+                            with ui.button("").style(
+                                "background:#071220; color:#d8e8ff; border:1px solid #2a4060; "
+                                "font-family:monospace; font-size:13px; padding:5px 14px; "
+                                "border-radius:20px; min-height:unset;"
+                            ) as pax_btn:
+                                pax_btn_label["el"] = ui.label(pax_summary()).style("font-family:monospace; font-size:13px;")
+                                ui.icon("expand_more").style("font-size:16px; margin-left:4px;")
+                            with ui.menu().props("auto-close=false") as pax_menu:
+                                with ui.column().style("background:#0d1e36; padding:16px 20px; min-width:260px; gap:12px;"):
+                                    for cat, sub, mn, mx in [("Adult","12+",1,9),("Children","2–11",0,9),("Infant","Under 2",0,4)]:
+                                        with ui.row().classes("items-center justify-between w-full"):
+                                            with ui.column().style("gap:0;"):
+                                                ui.label(cat).style("color:#d8e8ff; font-family:monospace; font-size:14px; font-weight:bold;")
+                                                ui.label(sub).style("color:#5a7a9a; font-family:monospace; font-size:11px;")
+                                            with ui.row().classes("items-center gap-2"):
+                                                def make_minus(c, minimum):
+                                                    def h():
+                                                        if bk["pax_counts"][c] > minimum:
+                                                            bk["pax_counts"][c] -= 1
+                                                            pax_btn_label["el"].set_text(pax_summary())
+                                                    return h
+                                                def make_plus(c, maximum):
+                                                    def h():
+                                                        if bk["pax_counts"][c] < maximum:
+                                                            bk["pax_counts"][c] += 1
+                                                            pax_btn_label["el"].set_text(pax_summary())
+                                                    return h
+                                                ui.button("−", on_click=make_minus(cat, mn)).style(
+                                                    "background:#071220; color:#FFD700; border:1px solid #2a4060; "
+                                                    "font-size:18px; min-height:unset; padding:0 10px; border-radius:4px;")
+                                                ui.label(str(bk["pax_counts"][cat])).bind_text_from(
+                                                    bk["pax_counts"], cat, backward=lambda v: str(v)
+                                                ).style("color:#fff; font-family:monospace; font-size:16px; min-width:20px; text-align:center;")
+                                                ui.button("+", on_click=make_plus(cat, mx)).style(
+                                                    "background:#071220; color:#FFD700; border:1px solid #2a4060; "
+                                                    "font-size:18px; min-height:unset; padding:0 10px; border-radius:4px;")
+                                    ui.separator().style("border-color:#2a4060; margin:4px 0;")
+                                    ui.button("Done", on_click=pax_menu.close).style(
+                                        "background:#FFD700; color:#000; font-family:monospace; font-weight:bold; width:100%; border-radius:4px;")
+                            pax_btn.on("click", pax_menu.open)
+
+                    # ── Cabin Class ───────────────────────────────────────────
+                    inp_cabin = ui.select(["Economy", "Business", "First"], value="Economy", label="Cabin Class"
+                        ).props("outlined").style(f"{FS} width:100%;")
+
+                    # ── Destination ───────────────────────────────────────────
+                    dest_map = {}
+                    for f in sorted_flights:
+                        d_iata = f.get("destination", "")
+                        if not d_iata: continue
+                        city  = get_city(d_iata)
+                        lbl_d = f"{city} ({d_iata})" if city and city != d_iata else d_iata
+                        dest_map[lbl_d] = d_iata
+
+                    flight_keys = list(all_flight_options.keys())
+
+                    inp_dest = ui.select(
+                        options=sorted(dest_map.keys()), label="Destination",
+                        value=None, with_input=True, clearable=True,
+                    ).props("outlined").style(f"{FS} width:100%; margin-top:16px;")
+
+                    # ── Departure + Return date ───────────────────────────────
+                    with ui.grid(columns=2).classes("gap-6 w-full").style("margin-top:16px;"):
+                        with ui.column().classes("w-full"):
+                            with ui.input("Departure Date", placeholder="DD/MM/YYYY") as inp_date:
+                                inp_date.props("outlined").style(f"{FS} width:100%;")
+                                with inp_date.add_slot("append"):
+                                    ui.icon("event").classes("cursor-pointer").style("color:#FFD700;").on("click", lambda: date_menu.open())
+                                with ui.menu() as date_menu:
+                                    _today = datetime.date.today().strftime("%Y/%m/%d")
+                                    ui.date(mask="DD/MM/YYYY").bind_value(inp_date).style(
+                                        "background:#0a1628; color:#d8e8ff;"
+                                    ).props(f":options=\"date => date >= '{_today}'\"")
+                        return_date_row = ui.column().classes("w-full")
+
+                    with return_date_row:
+                        with ui.input("Return Date", placeholder="DD/MM/YYYY") as inp_return_date:
+                            inp_return_date.props("outlined").style(f"{FS} width:100%;")
+                            with inp_return_date.add_slot("append"):
+                                ui.icon("event").classes("cursor-pointer").style("color:#FFD700;").on("click", lambda: ret_date_menu.open())
+                            with ui.menu() as ret_date_menu:
+                                ret_date_picker = ui.date(mask="DD/MM/YYYY").bind_value(inp_return_date).style(
+                                    "background:#0a1628; color:#d8e8ff;")
+                        ret_date_err = ui.label("").style("color:#FF6666; font-family:monospace; font-size:12px; margin-top:2px;")
+                    return_date_row.set_visibility(False)
+
+                    def update_ret_date_min():
+                        """Grey out return dates before departure in the calendar."""
+                        dep_val = (inp_date.value or "").strip()
+                        if dep_val:
+                            try:
+                                dt = datetime.datetime.strptime(dep_val, "%d/%m/%Y")
+                                # Add 1 day — return must be strictly after departure
+                                min_dt  = dt + datetime.timedelta(days=1)
+                                min_str = min_dt.strftime("%Y/%m/%d")
+                                ret_date_picker.props(f":options=\"date => date >= '{min_str}'\"")
+                            except Exception:
+                                pass
+                        # Validate current return value if already filled
+                        ret_val = (inp_return_date.value or "").strip()
+                        if dep_val and ret_val:
+                            try:
+                                d_dep = datetime.datetime.strptime(dep_val, "%d/%m/%Y")
+                                d_ret = datetime.datetime.strptime(ret_val, "%d/%m/%Y")
+                                if d_ret <= d_dep:
+                                    ret_date_err.set_text("⚠  Return date must be after departure date.")
+                                else:
+                                    ret_date_err.set_text("")
+                            except Exception:
+                                ret_date_err.set_text("")
+                        else:
+                            ret_date_err.set_text("")
+
+                    inp_date.on_value_change(lambda: update_ret_date_min())
+                    inp_return_date.on_value_change(lambda: update_ret_date_min())
+
+                    # ── Departure time chips ──────────────────────────────────
+                    time_section = ui.column().classes("w-full").style("margin-top:16px;")
+
+                    def render_time_options():
+                        time_section.clear()
+                        with time_section:
+                            if not bk["dest_iata"]:
+                                ui.label("Select a destination to see available departure times.").style(
+                                    "color:#5a7a9a; font-family:monospace; font-size:12px;")
+                                return
+                            filtered = [k for k in flight_keys
+                                if flight_map.get(all_flight_options.get(k,""),{}).get("destination") == bk["dest_iata"]]
+                            ui.label("DEPARTURE TIME").style(
+                                "color:#5a7a9a; font-family:monospace; font-size:11px; letter-spacing:1px;")
+                            if not filtered:
+                                ui.label("No flights available for this destination.").style(
+                                    "color:#666; font-family:monospace; font-size:12px; margin-top:4px;")
+                                return
+                            with ui.row().classes("gap-2 w-full flex-wrap").style("margin-top:6px;"):
+                                for fkey in filtered:
+                                    iata = all_flight_options.get(fkey)
+                                    fi   = flight_map.get(iata)
+                                    if not fi: continue
+                                    try:
+                                        dt       = datetime.datetime.fromisoformat(fi["scheduled"].replace("Z","+00:00"))
+                                        time_str = dt.strftime("%H:%M")
+                                        date_str = dt.strftime("%d/%m/%Y")
+                                    except Exception:
+                                        time_str = "--:--"; date_str = ""
+                                    chip_col  = STATUS_CHIP_COLOR.get(fi.get("status","scheduled"), "#4a90d9")
+                                    is_active = bk["flight_key"] == fkey
+                                    def make_th(fk, ds, ia):
+                                        def h():
+                                            bk["flight_key"]  = fk
+                                            bk["flight_iata"] = ia
+                                            if ds: inp_date.set_value(ds)
+                                            render_time_options()
+                                        return h
+                                    ui.button(time_str, on_click=make_th(fkey, date_str, iata)).style(
+                                        "font-family:monospace; font-size:14px; font-weight:bold; "
+                                        "padding:6px 16px; border-radius:6px; min-height:unset; "
+                                        + ("background:#1a3a6e; color:#FFD700; border:2px solid #FFD700;"
+                                           if is_active else
+                                           f"background:#071220; color:{chip_col}; border:1px solid {chip_col};"))
+
+                    render_time_options()
+
+                    def on_dest_change():
+                        bk["dest_iata"]  = dest_map.get(inp_dest.value)
+                        bk["flight_key"] = None; bk["flight_iata"] = None
+                        render_time_options()
+                    inp_dest.on_value_change(on_dest_change)
+
+                    # ── Fare bar + currency ───────────────────────────────────
+                    curr_row = ui.row().classes("gap-1 items-center")
+                    with ui.row().classes("items-center justify-between w-full").style(
+                        "margin-top:14px; padding:10px 14px; background:#071220; border:1px solid #1e3550; border-radius:6px;"):
+                        fare_label = ui.label(f"Fare  —  Economy  ·  £499").style(
+                            "color:#7aa8d8; font-family:monospace; font-size:13px;")
+                        curr_row = ui.row().classes("gap-1 items-center")
+
+                    def render_currency_buttons():
+                        curr_row.clear()
+                        with curr_row:
+                            for sym, code in [("£","GBP"),("$","USD"),("€","EUR")]:
+                                active = bk["curr_code"] == code
+                                def make_curr(s, c):
+                                    def h():
+                                        bk["curr_sym"] = s; bk["curr_code"] = c
+                                        render_currency_buttons(); update_fare_label()
+                                    return h
+                                ui.button(sym, on_click=make_curr(sym, code)).style(
+                                    "font-family:monospace; font-size:12px; padding:2px 8px; min-height:unset; border-radius:4px; "
+                                    + ("background:#1a3a6e; color:#FFD700; border:1px solid #FFD700;"
+                                       if active else "background:#0a1628; color:#5a7a9a; border:1px solid #2a4060;"))
+
+                    def update_fare_label():
+                        bk["cabin"] = inp_cabin.value
+                        amt = converted_fare()
+                        fare_label.set_text(f"Fare  —  {bk['cabin']}  ·  {bk['curr_sym']}{amt:,}")
+
+                    render_currency_buttons()
+                    inp_cabin.on_value_change(lambda: update_fare_label())
+
+                    # ── Continue → Step 2 ────────────────────────────────────
+                    step1_msg = ui.label("").style("color:#FF6666; font-size:13px; margin-top:8px;")
+
+                    def go_to_step2():
+                        if not bk["flight_iata"]:
+                            step1_msg.set_text("⚠  Please select a departure time first.")
+                            return
+                        if not inp_date.value:
+                            step1_msg.set_text("⚠  Please select a departure date.")
+                            return
+                        step1_msg.set_text("")
+                        bk["dep_date"] = inp_date.value
+                        bk["ret_date"] = inp_return_date.value if bk["trip_type"] == "Return" else ""
+                        bk["cabin"]    = inp_cabin.value
+                        step1_card.set_visibility(False)
+                        render_step2()
+                        step2_area.set_visibility(True)
+
+                    ui.button("Continue  →", on_click=go_to_step2).style(
+                        "background:#1a3a6e; color:#FFD700; border:2px solid #FFD700; "
+                        "font-family:monospace; font-size:15px; margin-top:20px; padding:10px 32px; border-radius:6px;")
+
+                # ══════════════════════════════════════════════════════════════
+                # STEP 2 — Flight summary + policy + passenger details
+                # ══════════════════════════════════════════════════════════════
+                CABIN_POLICY = {
+                    "Economy":  {
+                        "baggage": "1 × 23 kg checked  ·  1 × 10 kg cabin bag",
+                        "refund":  "Non-refundable  ·  Change fee £75 / person",
+                    },
+                    "Business": {
+                        "baggage": "2 × 32 kg checked  ·  2 × 12 kg cabin bags",
+                        "refund":  "Refundable (£150 fee)  ·  Free date changes",
+                    },
+                    "First": {
+                        "baggage": "3 × 32 kg checked  ·  No cabin bag limit",
+                        "refund":  "Fully refundable  ·  Free changes anytime",
+                    },
+                }
+
+                def render_step2():
+                    step2_area.clear()
+                    fi          = flight_map.get(bk["flight_iata"], {})
+                    fare_pp     = converted_fare()
+                    n_pax       = total_pax()
+                    total_price = fare_pp * n_pax
+                    sym         = bk["curr_sym"]
+                    code        = bk["curr_code"]
+                    cabin       = bk["cabin"]
+                    dest_city   = get_city(fi.get("destination",""))
+                    dep_time    = ""
+                    try:
+                        _dt = datetime.datetime.fromisoformat(fi["scheduled"].replace("Z","+00:00"))
+                        dep_time = _dt.strftime("%H:%M")
+                    except Exception:
+                        pass
+                    policy  = CABIN_POLICY.get(cabin, CABIN_POLICY["Economy"])
+                    sc      = STATUS_COLORS.get(fi.get("status",""), "#888")
+                    status  = fi.get("status","").upper()
+                    ret_row = f"<div><div style='color:#888;font-size:11px;'>RETURN DATE</div><div style='color:#fff;font-size:14px;'>{bk['ret_date']}</div></div>" if bk["ret_date"] else ""
+
+                    # Build flat passenger list: [(type, label), ...]
+                    pax_list = []
+                    for cat, count in [("Adult", bk["pax_counts"]["Adult"]),
+                                       ("Child", bk["pax_counts"]["Children"]),
+                                       ("Infant", bk["pax_counts"]["Infant"])]:
+                        for i in range(count):
+                            suffix = f" {i+1}" if count > 1 else ""
+                            pax_list.append((cat, f"{cat}{suffix}"))
+
+                    # One form state dict per passenger
+                    pax_forms = []
+                    for cat, label in pax_list:
+                        pax_forms.append({
+                            "cat":   cat,
+                            "label": label,
+                            "title": {"value": "Mr"},
+                            "first": {"el": None},
+                            "last":  {"el": None},
+                        })
+
+                    with step2_area:
+                        # ── Flight summary card ───────────────────────────────
+                        with ui.card().style(
+                            "background:#0d1e36; border:1px solid #2a4060; padding:24px 28px; "
+                            "border-radius:12px; width:100%; margin-bottom:12px;"
+                        ):
+                            with ui.row().classes("items-start justify-between w-full").style("margin-bottom:16px;"):
+                                with ui.column().style("gap:2px;"):
+                                    ui.label(f"{fi.get('flight_iata','')}  ·  {fi.get('airline','')}").style(
+                                        "color:#fff; font-family:monospace; font-size:18px; font-weight:bold;")
+                                    ui.label(f"{fi.get('origin','LHR')} → {dest_city} ({fi.get('destination','')})").style(
+                                        "color:#aaa; font-family:monospace; font-size:13px;")
+                                ui.label(status).style(
+                                    f"color:{sc}; font-family:monospace; font-size:12px; "
+                                    f"border:1px solid {sc}; padding:2px 10px; border-radius:4px;")
+
+                            ui.html(f"""
+                            <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;font-family:monospace;'>
+                              <div><div style='color:#888;font-size:11px;'>DEPARTURE</div>
+                                   <div style='color:#d8e8ff;font-size:14px;'>{bk['dep_date']}  {dep_time} UTC</div></div>
+                              {ret_row}
+                              <div><div style='color:#888;font-size:11px;'>CABIN CLASS</div>
+                                   <div style='color:#d8e8ff;font-size:14px;'>{cabin}</div></div>
+                              <div><div style='color:#888;font-size:11px;'>PASSENGERS</div>
+                                   <div style='color:#d8e8ff;font-size:14px;'>{pax_summary()}</div></div>
+                            </div>""")
+
+                            ui.separator().style("border-color:#1a3050; margin:16px 0 12px;")
+                            ui.label("FARE CONDITIONS").style(
+                                "color:#5a7a9a; font-family:monospace; font-size:11px; letter-spacing:1px; margin-bottom:10px;")
+                            refund_icon = "✅" if ("refundable" in policy["refund"].lower() and "non" not in policy["refund"].lower()) else "❌"
+                            ui.html(f"""
+                            <div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;font-family:monospace;'>
+                              <div style='display:flex;align-items:flex-start;gap:8px;'>
+                                <span style='font-size:16px;'>🧳</span>
+                                <div><div style='color:#888;font-size:11px;'>BAGGAGE ALLOWANCE</div>
+                                     <div style='color:#d8e8ff;font-size:13px;'>{policy['baggage']}</div></div>
+                              </div>
+                              <div style='display:flex;align-items:flex-start;gap:8px;'>
+                                <span style='font-size:16px;'>{refund_icon}</span>
+                                <div><div style='color:#888;font-size:11px;'>REFUND &amp; CHANGES</div>
+                                     <div style='color:#d8e8ff;font-size:13px;'>{policy['refund']}</div></div>
+                              </div>
+                            </div>""")
+
+                            ui.separator().style("border-color:#1a3050; margin:14px 0 10px;")
+                            with ui.row().classes("items-center justify-between w-full"):
+                                ui.label(f"Total  ·  {n_pax} passenger{'s' if n_pax>1 else ''}  ·  {cabin}").style(
+                                    "color:#5a7a9a; font-family:monospace; font-size:13px;")
+                                ui.label(f"{sym}{total_price:,}  {code}").style(
+                                    "color:#FFD700; font-family:monospace; font-size:22px; font-weight:bold;")
+
+                        # ── One passenger card per person ─────────────────────
+                        ui.label("PASSENGER DETAILS").style(
+                            "color:#5a7a9a; font-family:monospace; font-size:11px; "
+                            "letter-spacing:1px; margin:4px 0 2px;")
+                        ui.label("Enter names exactly as they appear on passport or travel document.").style(
+                            "color:#3a5a7a; font-family:monospace; font-size:12px; margin-bottom:10px;")
+
+                        for pf in pax_forms:
+                            with ui.card().style(
+                                "background:#0d1e36; border:1px solid #2a4060; padding:20px 24px; "
+                                "border-radius:10px; width:100%; margin-bottom:10px;"
+                            ):
+                                ui.label(f"Passenger  ·  {pf['label']}").style(
+                                    "color:#7aa8d8; font-family:monospace; font-size:12px; "
+                                    "font-weight:bold; margin-bottom:10px; letter-spacing:1px;")
+
+                                title_row = ui.row().classes("gap-2 items-center").style("margin-bottom:10px;")
+
+                                def make_title_renderer(pf_ref, tr_ref):
+                                    def render_titles():
+                                        tr_ref.clear()
+                                        with tr_ref:
+                                            for t in ["Mr", "Ms", "Mrs", "Dr"]:
+                                                active = pf_ref["title"]["value"] == t
+                                                def make_t(tt, pf2, rt2):
+                                                    def h():
+                                                        pf2["title"]["value"] = tt
+                                                        make_title_renderer(pf2, rt2)()
+                                                    return h
+                                                ui.button(t, on_click=make_t(t, pf_ref, tr_ref)).style(
+                                                    "font-family:monospace; font-size:12px; padding:3px 12px; "
+                                                    "min-height:unset; border-radius:4px; "
+                                                    + ("background:#1a3a6e; color:#FFD700; border:1px solid #FFD700;"
+                                                       if active else
+                                                       "background:#071220; color:#5a7a9a; border:1px solid #2a4060;"))
+                                    return render_titles
+
+                                make_title_renderer(pf, title_row)()
+
+                                with ui.grid(columns=2).classes("gap-4 w-full"):
+                                    inp_first = ui.input("First / Middle Name", placeholder="As on passport"
+                                        ).props("outlined").style(FS)
+                                    inp_last  = ui.input("Surname", placeholder="As on passport"
+                                        ).props("outlined").style(FS)
+                                pf["first"]["el"] = inp_first
+                                pf["last"]["el"]  = inp_last
+
+                        step2_msg = ui.label("").style("color:#FF6666; font-size:13px; margin-top:4px;")
+
+                        def issue_tickets():
+                            # Validate all forms
+                            for pf in pax_forms:
+                                first = (pf["first"]["el"].value or "").strip()
+                                last  = (pf["last"]["el"].value  or "").strip()
+                                if not first or not last:
+                                    step2_msg.set_text(f"⚠  Please fill in name for {pf['label']}.")
+                                    return
+                            step2_msg.set_text("")
+
+                            fi_data    = flight_map.get(bk["flight_iata"], {})
+                            fare_pp_v  = converted_fare()
+                            total_v    = fare_pp_v * total_pax()
+                            dep_date   = bk["dep_date"]
+                            ret_date   = bk["ret_date"]
+
+                            pax_db  = load_passengers()
+                            used    = set(pax_db.keys())
+                            booked  = []   # [(pnr, name, cat)]
+
+                            for pf in pax_forms:
+                                first = (pf["first"]["el"].value or "").strip()
+                                last  = (pf["last"]["el"].value  or "").strip()
+                                name  = f"{pf['title']['value']} {first} {last}".strip()
+                                pnr   = generate_pnr(used); used.add(pnr)
+                                pax_db[pnr] = {
+                                    "passenger_name": name,
+                                    "passenger_type": pf["cat"],
+                                    "flight_iata":    bk["flight_iata"],
+                                    "destination":    fi_data.get("destination",""),
+                                    "cabin_class":    cabin.lower(),
+                                    "fare_amount":    fare_pp_v,
+                                    "trip_type":      bk["trip_type"],
+                                    "departure_date": dep_date,
+                                    "return_date":    ret_date,
+                                    "departure_time": fi_data.get("scheduled",""),
+                                    "airline":        fi_data.get("airline",""),
+                                    "origin":         fi_data.get("origin","LHR"),
+                                    "currency":       code,
+                                    "source":         "manual",
+                                    "booked_at":      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                }
+                                booked.append((pnr, name, pf["cat"]))
+
+                            try:
+                                with open("data/pnr_database.json", "w") as fh:
+                                    json.dump(pax_db, fh, indent=2)
+                            except Exception as e:
+                                step2_msg.set_text(f"⚠  Save failed: {e}"); return
+
+                            step2_area.set_visibility(False)
+                            render_confirmation(booked, fi_data, fare_pp_v, total_v,
+                                                dep_date, ret_date, cabin, sym, code, dep_time)
+                            confirm_area.set_visibility(True)
+
+                        with ui.row().classes("gap-4 items-center").style("margin-top:8px;"):
+                            ui.button("← Back", on_click=lambda: (
+                                step2_area.set_visibility(False),
+                                step1_card.set_visibility(True),
+                            )).style(
+                                "background:transparent; color:#5a7a9a; border:1px solid #2a4060; "
+                                "font-family:monospace; font-size:14px; border-radius:6px;")
+                            ui.button("✈️  Issue Tickets", on_click=issue_tickets).style(
+                                "background:#1a3a6e; color:#FFD700; border:2px solid #FFD700; "
+                                "font-family:monospace; font-size:15px; padding:10px 32px; border-radius:6px;")
+
+                # ══════════════════════════════════════════════════════════════
+                # STEP 3 — Boarding-pass confirmation (multi-passenger)
+                # ══════════════════════════════════════════════════════════════
+                def render_confirmation(booked, fi_data, fare_pp, total_price,
+                                        dep_date, ret_date, cabin, sym, code, dep_time):
+                    dest_city = get_city(fi_data.get("destination",""))
+                    sc        = STATUS_COLORS.get(fi_data.get("status",""), "#888")
+                    status    = fi_data.get("status","").upper()
+                    disrupted_note = (
+                        "<span style='color:#FF4444;font-size:12px;'>⚠  Flight already disrupted — passengers are in CS queue now.</span>"
+                        if fi_data.get("status","") in DISRUPTED else
+                        "<span style='color:#888;font-size:12px;'>Will appear in CS queue automatically if flight is disrupted.</span>"
+                    )
+                    ret_row = (f"<div><div style='color:#888;font-size:11px;'>RETURN DATE</div>"
+                               f"<div style='color:#fff;font-size:14px;'>{ret_date}</div></div>") if ret_date else ""
+                    n_pax = len(booked)
+
+                    pnr_rows = "".join(
+                        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                        f"padding:8px 0;border-bottom:1px solid #1a2a40;'>"
+                        f"<div><span style='color:#5a7a9a;font-size:11px;'>{cat.upper()}  </span>"
+                        f"<span style='color:#d8e8ff;font-size:14px;'>{name}</span></div>"
+                        f"<span style='color:#FFD700;font-size:15px;font-weight:bold;letter-spacing:2px;'>{pnr}</span></div>"
+                        for pnr, name, cat in booked
+                    )
+
+                    confirm_area.clear()
+                    with confirm_area:
+                        ui.html(f"""
+                        <div style='background:#0d1a2e;border:1px solid #FFD700;border-radius:10px;
+                                    padding:24px 28px;font-family:monospace;'>
+                          <div style='color:#FFD700;font-size:11px;letter-spacing:2px;margin-bottom:14px;'>✅  BOOKING CONFIRMED</div>
+                          <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;'>
+                            <div>
+                              <div style='color:#fff;font-size:22px;font-weight:bold;'>{fi_data.get('flight_iata','')}</div>
+                              <div style='color:#aaa;font-size:13px;margin-top:2px;'>{fi_data.get('airline','')}</div>
+                            </div>
+                            <div style='color:{sc};font-size:12px;border:1px solid {sc};padding:2px 8px;border-radius:4px;'>{status}</div>
+                          </div>
+                          <div style='margin:14px 0;border-top:1px dashed #334;'></div>
+                          <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;'>
+                            <div><div style='color:#888;font-size:11px;'>FROM → TO</div>
+                                 <div style='color:#fff;font-size:14px;'>{fi_data.get('origin','LHR')} → {dest_city} ({fi_data.get('destination','')})</div></div>
+                            <div><div style='color:#888;font-size:11px;'>DEPARTURE</div>
+                                 <div style='color:#fff;font-size:14px;'>{dep_date}  {dep_time} UTC</div></div>
+                            {ret_row}
+                            <div><div style='color:#888;font-size:11px;'>CABIN</div>
+                                 <div style='color:#fff;font-size:14px;'>{cabin}</div></div>
+                            <div><div style='color:#888;font-size:11px;'>FARE / PERSON</div>
+                                 <div style='color:#d8e8ff;font-size:14px;'>{sym}{fare_pp:,} {code}</div></div>
+                            <div><div style='color:#888;font-size:11px;'>TOTAL  ({n_pax} pax)</div>
+                                 <div style='color:#FFD700;font-size:16px;font-weight:bold;'>{sym}{total_price:,} {code}</div></div>
+                          </div>
+                          <div style='margin:14px 0 8px;border-top:1px dashed #334;'></div>
+                          <div style='color:#888;font-size:11px;letter-spacing:1px;margin-bottom:8px;'>PASSENGERS &amp; PNRs</div>
+                          {pnr_rows}
+                          <div style='margin:14px 0;border-top:1px dashed #334;'></div>
+                          <div style='color:#888;font-size:11px;'>Booked — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+                          <div style='margin-top:6px;'>{disrupted_note}</div>
+                        </div>""")
+                        ui.button("➕ New Booking", on_click=render_tab2).style(
+                            "background:transparent; color:#FFD700; border:1px solid #FFD700; "
+                            "font-family:monospace; margin-top:16px;")
 
     def render_tab4():
         t4_container.clear()
@@ -797,8 +1395,9 @@ def main_page():
                         "fare":       p.get("fare_amount", 0),
                     })
 
+            # ── Candidate list ────────────────────────────────────────────────
             if not candidates:
-                ui.html("<p style='color:#00FF00;font-family:monospace;'>✅ No disrupted passengers.</p>")
+                ui.html("<p style='color:#00FF00;font-family:monospace;'>✅ No disrupted passengers. Add bookings on the Passengers tab — they'll appear here automatically when a flight is disrupted.</p>")
                 return
 
             names = [f"{'✓ ' if c['processed'] else ''}{c['pnr']} — {c['name']} ({c['flight']} → {c['destination']})"
@@ -1185,7 +1784,7 @@ def main_page():
                         state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
                         render_cs_conversation(text, audio)
 
-                # ── Turn 3: closing ────────────────────────────────────────
+                # ── Turn 3: closing (stays open until Emma says goodbye) ──
                 elif phase == "turn3":
                     rb = state.get("cs_rebooking_details")
                     details_note = (
@@ -1194,25 +1793,41 @@ def main_page():
                         f"you already told them this earlier in the call."
                     ) if rb else ""
                     prompt = (f'The passenger said: "{reply}"\n'
-                              f"If this is a genuine question, answer it directly and accurately using "
-                              f"what's already been discussed in this call.{details_note} If they are simply "
-                              "acknowledging, thanking you, or indicating they're finished, close the call "
-                              "warmly instead: apologise once more for the inconvenience, wish them well, "
-                              "and say a warm goodbye. Under 70 words.")
+                              f"If this is a genuine question or request (hotel, transport, anything new), "
+                              f"answer it directly and accurately using what's already been discussed.{details_note} "
+                              "If they are simply acknowledging, thanking you, or indicating they're done, "
+                              "close the call warmly: apologise once more for the inconvenience, wish them well, "
+                              "and say a warm goodbye.\n\n"
+                              "IMPORTANT: At the very end of your response, append exactly one of:\n"
+                              "  [CALL_COMPLETE] — if you just said goodbye and the call is truly over.\n"
+                              "  [CALL_CONTINUES] — if you answered a question and the passenger may reply again.\n"
+                              "Never omit this tag. Under 80 words.")
                     text  = await emma_say(prompt, hist, p['airline'])
                     try:   audio = await asyncio.to_thread(synth_for_state, text)
                     except: audio = None
-                    state["cs_messages"].append({"role": "assistant", "content": [{"text": text}]})
 
-                    mark_processed(p["flight"])
-                    transcript = [{"role": m["role"], "text": m["content"][0]["text"]} for m in state["cs_messages"]]
-                    write_log(p["flight"], p["status"], p["airline"], p["dest_iata"], state["cs_choice"], transcript)
-                    state["cs_phase"] = "complete"
-                    render_cs_conversation(text, audio)
-                    render_tab3()
-                    refresh_tab1_tab2()
-                    render_tab4()
-                    render_tab5()
+                    # Parse completion signal — default to continues if tag missing
+                    call_complete = "[CALL_COMPLETE]" in text
+                    text_clean = (text
+                                  .replace("[CALL_COMPLETE]", "")
+                                  .replace("[CALL_CONTINUES]", "")
+                                  .strip())
+
+                    state["cs_messages"].append({"role": "assistant", "content": [{"text": text_clean}]})
+
+                    if call_complete:
+                        mark_processed(p["flight"])
+                        transcript = [{"role": m["role"], "text": m["content"][0]["text"]} for m in state["cs_messages"]]
+                        write_log(p["flight"], p["status"], p["airline"], p["dest_iata"], state["cs_choice"], transcript)
+                        state["cs_phase"] = "complete"
+                        render_cs_conversation(text_clean, audio)
+                        render_tab3()
+                        refresh_tab1_tab2()
+                        render_tab4()
+                        render_tab5()
+                    else:
+                        # Passenger still has questions — stay in turn3
+                        render_cs_conversation(text_clean, audio)
 
             async def process_approved():
                 p      = state["cs_passenger"]
