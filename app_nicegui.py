@@ -812,9 +812,6 @@ def main_page():
                                         def h():
                                             bk["flight_key"]  = fk
                                             bk["flight_iata"] = ia
-                                            # Only auto-fill date if user hasn't selected one yet
-                                            if ds and not (inp_date.value or "").strip():
-                                                inp_date.set_value(ds)
                                             render_time_options()
                                         return h
                                     ui.button(time_str, on_click=make_th(fkey, date_str, iata)).style(
@@ -829,6 +826,7 @@ def main_page():
                     def on_dest_change():
                         bk["dest_iata"]  = dest_map.get(inp_dest.value)
                         bk["flight_key"] = None; bk["flight_iata"] = None
+                        inp_date.set_value("")
                         render_time_options()
                     inp_dest.on_value_change(on_dest_change)
 
@@ -872,6 +870,16 @@ def main_page():
                             return
                         if not inp_date.value:
                             step1_msg.set_text("⚠  Please select a departure date.")
+                            return
+                        # Block booking on disrupted/cancelled flights
+                        fi_check = flight_map.get(bk["flight_iata"], {})
+                        blocked_statuses = {"cancelled", "diverted", "incident"}
+                        if fi_check.get("status", "") in blocked_statuses:
+                            step1_msg.set_text(
+                                f"⛔  Cannot book — flight is {fi_check['status'].upper()}. "
+                                "Please select a different flight."
+                            )
+                            step1_msg.style("color:#FF4444; font-size:13px; margin-top:8px;")
                             return
                         step1_msg.set_text("")
                         bk["dep_date"] = inp_date.value
@@ -1539,6 +1547,8 @@ def main_page():
                     for m in state["cs_messages"]:
                         role = m["role"]
                         txt  = m["content"][0]["text"]
+                        # Always strip control tags — they must never reach the UI
+                        txt  = txt.replace("[CALL_COMPLETE]", "").replace("[CALL_CONTINUES]", "").strip()
                         cls  = "emma-bubble" if role == "assistant" else "pax-bubble"
                         tag  = "🎧 EMMA" if role == "assistant" else "🧑 PASSENGER"
                         color = "#FFD700" if role == "assistant" else "#888"
