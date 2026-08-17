@@ -812,7 +812,9 @@ def main_page():
                                         def h():
                                             bk["flight_key"]  = fk
                                             bk["flight_iata"] = ia
-                                            if ds: inp_date.set_value(ds)
+                                            # Only auto-fill date if user hasn't selected one yet
+                                            if ds and not (inp_date.value or "").strip():
+                                                inp_date.set_value(ds)
                                             render_time_options()
                                         return h
                                     ui.button(time_str, on_click=make_th(fkey, date_str, iata)).style(
